@@ -3,7 +3,7 @@ import time
 import random
 from datetime import datetime
 
-url_api = "http://localhost:8000/api/sensors/t001/data"
+url_api = "http://localhost:8001/api/sensors/t001/data"
 print("Enviando datos... Pulsa Ctrl+C para parar.")
 
 while True:
