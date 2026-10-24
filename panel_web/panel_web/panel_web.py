@@ -1,50 +1,50 @@
 import reflex as rx
 import sqlite3
+import os
+
+# --- CONFIGURACIÓN DE RUTAS SEGURAS ---
+DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
 
 # 1. INICIALIZACIÓN DE DATOS DE EJEMPLO
 def poblar_base_datos():
-    """Inserta datos de prueba si las tablas están vacías."""
     try:
-        # CORRECCIÓN: Ruta a la base de datos en la misma carpeta
-        conexion = sqlite3.connect('../agrotech.db')
-        cursor = conexion.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM parcels")
-        if cursor.fetchone()[0] == 0:
-            cursor.executescript("""
-                INSERT INTO parcels (name, location) VALUES ('Parcela Norte', 'Sector A');
-                INSERT INTO parcels (name, location) VALUES ('Parcela Sur', 'Sector B');
-                INSERT INTO parcels (name, location) VALUES ('Invernadero Principal', 'Sector C');
-                INSERT INTO parcels (name, location) VALUES ('Viñedo Este', 'Sector D');
-                INSERT INTO parcels (name, location) VALUES ('Huerto Central', 'Sector E');
-            """)
+        with sqlite3.connect(RUTA_DB) as conexion:
+            cursor = conexion.cursor()
             
-        cursor.execute("SELECT COUNT(*) FROM sensors")
-        if cursor.fetchone()[0] == 0:
-            cursor.executescript("""
-                INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('t001', 1, 'temperaturaAmb', 'ºC', 'Sensor de temperatura ambiente');
-                INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('h001', 1, 'humedad_suelo', '%', 'Sensor de humedad del suelo');
-                INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('l001', 2, 'luminosidad', 'lux', 'Sensor de luz solar');
-                INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('t002', 3, 'temperaturaInt', 'ºC', 'Temperatura interior invernadero');
-                INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('ph01', 4, 'ph', 'pH', 'Sensor de acidez del suelo');
-            """)
+            cursor.execute("CREATE TABLE IF NOT EXISTS parcels (id INTEGER PRIMARY KEY, name TEXT, location TEXT)")
+            cursor.execute("SELECT COUNT(*) FROM parcels")
+            if cursor.fetchone()[0] == 0:
+                cursor.executescript("""
+                    INSERT INTO parcels (name, location) VALUES ('Parcela Norte', 'Sector A');
+                    INSERT INTO parcels (name, location) VALUES ('Parcela Sur', 'Sector B');
+                    INSERT INTO parcels (name, location) VALUES ('Invernadero Principal', 'Sector C');
+                    INSERT INTO parcels (name, location) VALUES ('Viñedo Este', 'Sector D');
+                    INSERT INTO parcels (name, location) VALUES ('Huerto Central', 'Sector E');
+                """)
+                
+            cursor.execute("CREATE TABLE IF NOT EXISTS sensors (id TEXT PRIMARY KEY, parcel_id INTEGER, type TEXT, unit TEXT, description TEXT)")
+            cursor.execute("SELECT COUNT(*) FROM sensors")
+            if cursor.fetchone()[0] == 0:
+                cursor.executescript("""
+                    INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('t001', 1, 'temperaturaAmb', 'ºC', 'Sensor de temperatura ambiente');
+                    INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('h001', 1, 'humedad_suelo', '%', 'Sensor de humedad del suelo');
+                    INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('l001', 2, 'luminosidad', 'lux', 'Sensor de luz solar');
+                    INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('t002', 3, 'temperaturaInt', 'ºC', 'Temperatura interior invernadero');
+                    INSERT INTO sensors (id, parcel_id, type, unit, description) VALUES ('ph01', 4, 'ph', 'pH', 'Sensor de acidez del suelo');
+                """)
 
-        # NUEVO: Insertar alertas de ejemplo para que la tabla alerts no esté vacía
-        cursor.execute("SELECT COUNT(*) FROM alerts")
-        if cursor.fetchone()[0] == 0:
-            cursor.executescript("""
-                INSERT INTO alerts (sensor_id, timestamp, type, message, acknowledged) 
-                VALUES ('t001', '2026-10-24T10:15:00Z', 'HIGH', 'Temperatura crítica superada', 0);
-                INSERT INTO alerts (sensor_id, timestamp, type, message, acknowledged) 
-                VALUES ('h001', '2026-10-24T11:20:00Z', 'LOW', 'Humedad por debajo del umbral', 1);
-            """)
-            
-        conexion.commit()
+            cursor.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, sensor_id TEXT, timestamp TEXT, type TEXT, message TEXT, acknowledged INTEGER)")
+            cursor.execute("SELECT COUNT(*) FROM alerts")
+            if cursor.fetchone()[0] == 0:
+                cursor.executescript("""
+                    INSERT INTO alerts (sensor_id, timestamp, type, message, acknowledged) 
+                    VALUES ('t001', '2026-10-24T10:15:00Z', 'HIGH', 'Temperatura crítica superada', 0);
+                    INSERT INTO alerts (sensor_id, timestamp, type, message, acknowledged) 
+                    VALUES ('h001', '2026-10-24T11:20:00Z', 'LOW', 'Humedad por debajo del umbral', 1);
+                """)
     except sqlite3.Error as e:
         print(f"Error al poblar BD: {e}")
-    finally:
-        if 'conexion' in locals():
-            conexion.close()
 
 poblar_base_datos()
 
@@ -56,24 +56,44 @@ class EstadoAgrotech(rx.State):
 
     def obtener_datos(self):
         try:
-            # CORRECCIÓN: Ruta a la base de datos en la misma carpeta
-            conexion = sqlite3.connect('../agrotech.db')
-            cursor = conexion.cursor()
-            
-            cursor.execute("SELECT id, name, location FROM parcels ORDER BY id ASC LIMIT 5")
-            self.parcelas = [[str(col) for col in row] for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT id, type, unit, description FROM sensors ORDER BY id ASC LIMIT 5")
-            self.sensores = [[str(col) for col in row] for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT sensor_id, timestamp, value FROM sensor_data ORDER BY id DESC LIMIT 15")
-            self.lecturas = [[str(col) for col in row] for row in cursor.fetchall()]
-            
+            with sqlite3.connect(RUTA_DB) as conexion:
+                cursor = conexion.cursor()
+                
+                cursor.execute("SELECT id, name, location FROM parcels ORDER BY id ASC LIMIT 5")
+                self.parcelas = [[str(col) if col is not None else "" for col in row] for row in cursor.fetchall()]
+                
+                cursor.execute("SELECT id, type, unit, description FROM sensors ORDER BY id ASC LIMIT 5")
+                self.sensores = [[str(col) if col is not None else "" for col in row] for row in cursor.fetchall()]
+                
+                cursor.execute("SELECT sensor_id, timestamp, value FROM sensor_data ORDER BY id DESC LIMIT 15")
+                datos_brutos = cursor.fetchall()
+                datos_formateados = []
+                
+                for fila in datos_brutos:
+                    sensor = str(fila[0]) if fila[0] else "Desconocido"
+                    
+                    fecha_cruda = str(fila[1]) if fila[1] else ""
+                    fecha_limpia = fecha_cruda[:19].replace('T', ' ') if len(fecha_cruda) >= 19 else fecha_cruda
+                    
+                    valor_real = float(fila[2]) if fila[2] is not None else 0.0
+                    valor_str = str(valor_real)
+                    
+                    # Colores en tonos pastel
+                    color_texto = "var(--gray-12)"
+                    if sensor in ["t001", "t002"]:
+                        if valor_real > 30:
+                            color_texto = "#ff8da1" # Rojo pastel
+                        elif valor_real < 20:
+                            color_texto = "#82b1ff" # Azul pastel
+                        else:
+                            color_texto = "#66cdaa" # Verde pastel
+                            
+                    datos_formateados.append([sensor, fecha_limpia, valor_str, color_texto])
+                    
+                self.lecturas = datos_formateados
+                
         except sqlite3.Error as e:
             print(f"Error en la base de datos: {e}")
-        finally:
-            if 'conexion' in locals():
-                conexion.close()
 
 # 3. COMPONENTES DE TABLAS
 def crear_tabla(cabeceras: list[str], datos: list[list[str]], render_fila) -> rx.Component:
@@ -111,28 +131,28 @@ def fila_sensor(fila: list[str]) -> rx.Component:
     )
 
 def fila_lectura(fila: list[str]) -> rx.Component:
-    # Condicional de Reflex (switch/match) para añadir la unidad según el ID
     valor_con_unidad = rx.match(
         fila[0],
-        ("t001", fila[2] + " ºC"),   # Si es t001, añade ºC
-        ("t002", fila[2] + " ºC"),   # Si es t002, añade ºC
-        ("h001", fila[2] + " %"),    # Si es h001, añade %
-        ("l001", fila[2] + " lux"),  # Si es l001, añade lux
-        ("ph01", fila[2] + " pH"),   # Si es ph01, añade pH
-        fila[2]                      # Por defecto, devuelve solo el número
+        ("t001", fila[2] + " ºC"),  
+        ("t002", fila[2] + " ºC"),  
+        ("h001", fila[2] + " %"),    
+        ("l001", fila[2] + " lux"),  
+        ("ph01", fila[2] + " pH"),   
+        fila[2]                      
     )
 
     return rx.table.row(
         rx.table.row_header_cell(rx.badge(fila[0], color_scheme="blue", variant="soft")),
         rx.table.cell(rx.text(fila[1], size="2", color="var(--gray-11)")),
-        # Imprimimos el valor ya formateado con su unidad
-        rx.table.cell(rx.text(valor_con_unidad, weight="bold")),
+        rx.table.cell(rx.text(valor_con_unidad, weight="bold", color=fila[3])),
         rx.table.cell(rx.badge("Recibido", color_scheme="grass"))
     )
 
 # 4. INTERFAZ PRINCIPAL
 def index() -> rx.Component:
     return rx.box(
+        rx.script("setInterval(() => { const btn = document.getElementById('btn-actualizar'); if(btn) btn.click(); }, 5000);"),
+        
         rx.hstack(
             rx.hstack(
                 rx.icon(tag="leaf", color="var(--grass-9)", size=32),
@@ -157,13 +177,16 @@ def index() -> rx.Component:
                     align_items="start"
                 ),
                 rx.spacer(),
+                
+                # --- BOTÓN OCULTO ---
                 rx.button(
                     rx.icon(tag="refresh-cw", size=18),
                     "Actualizar Datos", 
+                    id="btn-actualizar", 
                     on_click=EstadoAgrotech.obtener_datos, 
-                    size="3",
-                    color_scheme="grass",
+                    display="none", # Aquí hacemos que desaparezca visualmente
                 ),
+                
                 width="100%",
                 align_items="center",
                 flex_direction=["column", "row"], 

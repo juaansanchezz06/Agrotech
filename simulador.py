@@ -2,12 +2,6 @@ import requests
 import time
 import random
 import json
-from datetime import datetime
-
-import requests
-import time
-import random
-import json
 from datetime import datetime, timezone
 
 url_base = "http://localhost:8001/api/sensors"
