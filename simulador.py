@@ -36,6 +36,7 @@ while True:
         
         try:
             respuesta = requests.post(url_api, json=paquete)
+            
             print(f"Sensor {sensor['id']} enviado: {valor} - Estado: {respuesta.status_code}")
         except Exception:
             print("No hay conexión. Esperando a que la API se encienda en el puerto 8001...")
