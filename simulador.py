@@ -21,7 +21,7 @@ while True:
         paquete = {
             "sensor_id": sensor["id"],
             # Solución al DeprecationWarning: usamos timezone.utc
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "value": valor,
             "raw": json.dumps({"estado_bateria": random.randint(20, 100)})
         }
