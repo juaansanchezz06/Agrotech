@@ -53,6 +53,18 @@ class EstadoAgrotech(rx.State):
     parcelas: list[list[str]] = []
     sensores: list[list[str]] = []
     lecturas: list[list[str]] = []
+    
+    # Variables de control para el boceto
+    parcela_seleccionada: str = "Parcela Norte"
+    temp_amb: str = "--"
+    temp_suelo: str = "--"
+    lux: str = "--"
+    ph: str = "--"
+    humedad: str = "--"
+
+    def set_parcela_seleccionada(self, valor: str):
+        self.parcela_seleccionada = valor
+        self.obtener_datos()
 
     def obtener_datos(self):
         try:
@@ -92,8 +104,93 @@ class EstadoAgrotech(rx.State):
                     
                 self.lecturas = datos_formateados
                 
+                # Obtención de datos más recientes para los indicadores circulares
+                cursor.execute("""
+                    SELECT sensor_id, value FROM sensor_data 
+                    WHERE id IN (
+                        SELECT MAX(id) FROM sensor_data GROUP BY sensor_id
+                    )
+                """)
+                ultimos_datos = dict(cursor.fetchall())
+                
+                self.temp_amb = f"{ultimos_datos.get('t001', '--')} ºC"
+                self.temp_suelo = f"{ultimos_datos.get('t002', '--')} ºC"
+                self.humedad = f"{ultimos_datos.get('h001', '--')} %"
+                self.lux = f"{ultimos_datos.get('l001', '--')} Lux"
+                self.ph = f"{ultimos_datos.get('ph01', '6.5')} pH"
+                
         except sqlite3.Error as e:
             print(f"Error en la base de datos: {e}")
+
+# --- 3. COMPONENTES VISUALES ---
+def tarjeta_metrica_circular(titulo: str, valor: str, icono: str, color_borde: str) -> rx.Component:
+    return rx.vstack(
+        rx.text(titulo, weight="bold", size="3", color="var(--gray-11)"),
+        rx.center(
+            rx.vstack(
+                rx.icon(tag=icono, size=28, color=color_borde),
+                rx.text(valor, weight="bold", size="5"),
+                align="center",
+                justify="center",
+            ),
+            width="140px",
+            height="140px",
+            border_radius="50%",
+            border=f"3px solid {color_borde}",
+            box_shadow="0 4px 10px rgba(0,0,0,0.05)",
+            background="var(--gray-2)",
+        ),
+        align="center",
+        spacing="2"
+    )
+
+def vista_boceto_parcelas() -> rx.Component:
+    return rx.vstack(
+    rx.hstack(
+        rx.hstack(
+            rx.heading("PARCELA:", size="4", color="var(--gray-12)"),
+            rx.select(
+                ["Parcela Norte", "Parcela Sur", "Invernadero Principal", "Viñedo Este", "Huerto Central"],
+                value=EstadoAgrotech.parcela_seleccionada,
+                on_change=EstadoAgrotech.set_parcela_seleccionada,
+                variant="soft",
+            ),
+            align="center",
+            spacing="2"
+        ),
+        width="100%",
+        justify="between",
+        align="center",
+        padding_bottom="1.5em",
+        border_bottom="1px solid var(--gray-5)",
+        margin_bottom="1.5em"
+    ),
+    rx.flex(
+        tarjeta_metrica_circular("Tª Ambiente", EstadoAgrotech.temp_amb, "thermometer", "#ff8da1"),
+        tarjeta_metrica_circular("Tª Suelo", EstadoAgrotech.temp_suelo, "sprout", "#82b1ff"),
+        tarjeta_metrica_circular("Luminosidad", EstadoAgrotech.lux, "sun", "#ffd54f"),
+        wrap="wrap",
+        justify="center",
+        spacing="6",
+        width="100%",
+        margin_bottom="2em"
+    ),
+    rx.flex(
+        tarjeta_metrica_circular("pH Suelo", EstadoAgrotech.ph, "flask-conical", "#b39ddb"),
+        tarjeta_metrica_circular("Humedad (Hº)", EstadoAgrotech.humedad, "droplets", "#4dd0e1"),
+        wrap="wrap",
+        justify="center",
+        spacing="8",
+        width="100%"
+    ),
+    width="100%",
+    padding="2em",
+    border="1px solid var(--gray-6)",
+    border_radius="16px",
+    background="var(--gray-1)",
+    box_shadow="0 4px 20px rgba(0, 0, 0, 0.05)",
+    margin_bottom="2em"
+    )
 
 # 3. COMPONENTES DE TABLAS
 def crear_tabla(cabeceras: list[str], datos: list[list[str]], render_fila) -> rx.Component:
@@ -144,7 +241,7 @@ def fila_lectura(fila: list[str]) -> rx.Component:
     return rx.table.row(
         rx.table.row_header_cell(rx.badge(fila[0], color_scheme="blue", variant="soft")),
         rx.table.cell(rx.text(fila[1], size="2", color="var(--gray-11)")),
-        rx.table.cell(rx.text(valor_con_unidad, weight="bold", color=fila[3])),
+        rx.table.cell(rx.text(fila[2], weight="bold", color=fila[3])),
         rx.table.cell(rx.badge("Recibido", color_scheme="grass"))
     )
 
@@ -206,7 +303,12 @@ def index() -> rx.Component:
                     value="lecturas",
                 ),
                 rx.tabs.content(
-                    crear_tabla(["ID Parcela", "Nombre", "Ubicación"], EstadoAgrotech.parcelas, fila_parcela),
+                    rx.vstack(
+                        vista_boceto_parcelas(),
+                        crear_tabla(["ID Parcela", "Nombre", "Ubicación"], EstadoAgrotech.parcelas, fila_parcela),
+                        spacing="4",
+                        width="100%"
+                    ),
                     value="parcelas",
                 ),
                 rx.tabs.content(
