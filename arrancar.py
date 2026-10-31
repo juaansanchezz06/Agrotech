@@ -4,15 +4,16 @@ import time
 
 try:
     print("Iniciando API...")
-    api = subprocess.Popen(["uvicorn", "api:app", "--port", "8001"], shell=True)
+    # Usamos sys.executable -m en lugar de shell=True para compatibilidad multiplataforma
+    api = subprocess.Popen([sys.executable, "-m", "uvicorn", "api:app", "--port", "8001"])
     time.sleep(2) 
 
     print("Iniciando Simulador...")
     simulador = subprocess.Popen([sys.executable, "simulador.py"])
 
     print("Iniciando Reflex...")
-    # Añadimos cwd="panel_web" para que ejecute el comando dentro de esa carpeta
-    reflex = subprocess.Popen(["reflex", "run"], shell=True, cwd="panel_web")
+    # Ejecutamos Reflex como módulo de Python dentro de la carpeta panel_web
+    reflex = subprocess.Popen([sys.executable, "-m", "reflex", "run"], cwd="panel_web")
 
     print("\n🚀 ¡Todo en marcha! Ve a http://localhost:3000")
     print("Pulsa Ctrl+C en esta terminal para apagar todo de golpe.\n")
