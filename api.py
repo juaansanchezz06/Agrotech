@@ -2,9 +2,10 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket
 from pydantic import BaseModel
 from typing import Optional
 import sqlite3
-
+from fastapi.responses import HTMLResponse
 # Inicialización de la aplicación
 app = FastAPI()
+
 
 # --- CREACIÓN DE LA BASE DE DATOS ---
 def init_db():
@@ -135,6 +136,10 @@ def historico_datos(
 @app.get("/api/dashboard")
 def resumen_dashboard():
     return {"status": "ok", "message": "Dashboard listo."}
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return HTMLResponse(content="")
 
 @app.websocket("/ws/parcels/{id}")
 async def websocket_endpoint(websocket: WebSocket, id: int):

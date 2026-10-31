@@ -2,6 +2,7 @@ import reflex as rx
 
 config = rx.Config(
     app_name="panel_web",
+    backend_port=8002,
     plugins=[
         rx.plugins.SitemapPlugin(),
         rx.plugins.TailwindV4Plugin(),
