@@ -3,7 +3,9 @@ from pydantic import BaseModel
 from typing import Optional  
 import sqlite3  
 import hashlib
-from fastapi.responses import HTMLResponse  
+from fastapi.responses import HTMLResponse
+import asyncio
+from fastapi import WebSocketDisconnect  
 
 # Inicialización de la aplicación  
 app = FastAPI()  
@@ -177,4 +179,32 @@ def favicon():
 @app.websocket("/ws/parcels/{id}")  
 async def websocket_endpoint(websocket: WebSocket, id: int):  
     await websocket.accept()  
-    await websocket.send_text(f"Conectado al streaming en tiempo real de la parcela {id}")
+    try:
+        while True:
+            conexion = sqlite3.connect('agrotech.db')  
+            cursor = conexion.cursor()  
+            
+            # Buscamos los datos más recientes de los sensores que pertenecen a esta parcela
+            cursor.execute("""
+                SELECT s.id, s.type, sd.value, sd.timestamp 
+                FROM sensors s
+                LEFT JOIN sensor_data sd ON s.id = sd.sensor_id
+                WHERE s.parcel_id = ?
+                ORDER BY sd.timestamp DESC LIMIT 5
+            """, (id,))
+            
+            datos = [{"sensor": row[0], "tipo": row[1], "valor": row[2], "hora": row[3]} for row in cursor.fetchall()]
+            conexion.close()
+
+            # Enviamos los datos en formato JSON al cliente conectado
+            await websocket.send_json({
+                "parcela_id": id,
+                "mensaje": "Streaming en tiempo real activo",
+                "datos_recientes": datos
+            })
+            
+            # Pausa de 5 segundos antes de enviar la siguiente actualización
+            await asyncio.sleep(5)
+            
+    except WebSocketDisconnect:
+        print(f"Cliente desconectado del streaming de la parcela {id}")

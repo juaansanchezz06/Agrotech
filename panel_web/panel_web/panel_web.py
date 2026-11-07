@@ -2,12 +2,16 @@ import reflex as rx
 import sqlite3
 import os
 from .login import login_page, BaseState
+import json
+import asyncio
+import websockets
 
 DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
 RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
 
 # 1. ESTADO DEL PANEL Y OBTENCIÓN DINÁMICA DE DATOS
 class EstadoAgrotech(BaseState):
+    _id_streaming_actual: int = 0
     parcelas: list[list[str]] = []
     sensores: list[list[str]] = []
     lecturas: list[list[str]] = []
@@ -24,10 +28,53 @@ class EstadoAgrotech(BaseState):
     def comprobar_acceso(self):
         if self.usuario_actual == "":
             return rx.redirect("/")
-        self.obtener_datos()
+        else:
+            self.obtener_datos()
+            # Retornamos la acción para que se conecte al WS al cargar la página
+            return EstadoAgrotech.iniciar_streaming
 
-    def set_parcela_seleccionada(self, valor: str):
-        self.parcela_seleccionada = valor
+    def set_parcela_seleccionada(self, valor: str):  
+        self.parcela_seleccionada = valor  
+        self.obtener_datos()  
+        # Al cambiar de parcela, invocamos el WS para conectarnos al nuevo ID
+        return EstadoAgrotech.iniciar_streaming
+
+    @rx.event(background=True)
+    async def iniciar_streaming(self):
+        # Diccionario para mapear los nombres del select a los IDs de la base de datos
+        ids_parcelas = {
+            "Parcela Norte": 1, "Parcela Sur": 2, 
+            "Invernadero Principal": 3, "Viñedo Este": 4, "Huerto Central": 5
+        }
+        
+        async with self:
+            id_parcela = ids_parcelas.get(self.parcela_seleccionada, 1)
+            # Evita crear múltiples conexiones a la misma parcela
+            if self._id_streaming_actual == id_parcela:
+                return
+            self._id_streaming_actual = id_parcela
+
+        uri = f"ws://localhost:8001/ws/parcels/{id_parcela}"
+        
+        try:
+            async with websockets.connect(uri) as websocket:
+                while True:
+                    # Comprobamos si el usuario seleccionó otra parcela para apagar este túnel
+                    async with self:
+                        if self._id_streaming_actual != id_parcela:
+                            break
+                            
+                    # Nos quedamos esperando el envío del servidor (FastAPI)
+                    mensaje = await websocket.recv()
+                    
+                    # Cuando llega el pulso de datos del WS, actualizamos la pantalla
+                    async with self:
+                        self.obtener_datos()
+                        
+        except Exception as e:
+            print(f"Streaming desconectado de parcela {id_parcela}: {e}")
+            async with self:
+                self._id_streaming_actual = 0
         
         multiplicador = 1.0
         if "Sur" in valor:
@@ -244,8 +291,6 @@ def index() -> rx.Component:
             </style>
         """),
         
-        # Script de auto-actualización silenciosa en vivo cada 5s
-        rx.script("setInterval(() => { const btn = document.getElementById('btn-actualizar'); if(btn) btn.click(); }, 5000);"),
         
         # TOP NAVBAR CON PERFIL DE USUARIO
         rx.hstack(
@@ -279,15 +324,6 @@ def index() -> rx.Component:
                     border="1px solid var(--gray-5)",
                     align_items="center",
                     spacing="2"
-                ),
-                
-                rx.button(
-                    rx.icon(tag="log-out", size=16),
-                    "Cerrar Sesión",
-                    on_click=BaseState.cerrar_sesion,
-                    color_scheme="red",
-                    variant="ghost",
-                    size="2"
                 ),
                 spacing="4",
                 align_items="center",
