@@ -4,42 +4,58 @@
 
 En este proyecto se ha desarrollado un sistema integral de monitorización agrícola en tiempo real para el **II Reto Agrotech 2026**. 
 
-El sistema recolecta datos periódicos transmitidos por sensores multivariable (temperatura, humedad, luminosidad, etc.), los procesa mediante una API REST desarrollada en FastAPI, los almacena de forma persistente en una base de datos SQLite y los visualiza en tiempo real a través de un panel web interactivo construido con Reflex.
+El sistema recolecta datos periódicos transmitidos por sensores multivariable (temperatura, humedad, luminosidad, pH, etc.), los procesa mediante una API REST desarrollada en FastAPI, los almacena de forma persistente en una base de datos SQLite con contraseñas hasheadas (SHA-256) y los visualiza en tiempo real a través de un panel web interactivo construido con Reflex, protegido mediante control de acceso y gestión de sesiones.
 
 ## Objetivo del proyecto
 
-Implementar una arquitectura modular end-to-end orientada a IoT e ingeniería agrícola:
+Implementar una arquitectura modular *end-to-end* orientada a IoT e ingeniería agrícola:
 
 - **Simulación IoT**: Generación y envío automatizado de telemetría de sensores con variabilidad en el rango de datos y métricas de batería.
-- **Backend API REST & WebSockets**: Ingesta, validación y persistencia de datos, junto con soporte para streaming de eventos.
-- **Persistencia**: Almacenamiento relacional ligero y eficiente con SQLite.
+- **Backend API REST & WebSockets**: Ingesta, validación, persistencia de datos y sistema de autenticación de usuarios.
+- **Seguridad e Identidad**: Autenticación con almacenamiento local de credenciales, cifrado de contraseñas con SHA-256 y protección de rutas.
 - **Frontend Dashboard**: Panel web reactivo y dinámico con auto-refresco visual para supervisión de parcelas, sensores y datos en tiempo real.
+- **Orquestación**: Ejecución simplificada de todo el ecosistema con un único comando.
 
 ## Conceptos Básicos y Componentes
 
-### API REST (`api.py`)
-Desarrollada en FastAPI. Es la encargada de recibir las mediciones enviadas por los sensores, consultar información referente a parcelas y sensores asociados, y ofrecer endpoints de filtrado histórico de lecturas. Además, expone un WebSocket para transmisión continua de datos.
+### 1. API REST y Backend (`api.py`)
+Desarrollada en FastAPI. Es la encargada de recibir las mediciones enviadas por los sensores, autenticar usuarios contra hashes SHA-256, consultar información de parcelas y sensores asociados, y ofrecer endpoints de filtrado histórico de lecturas. Además, expone un WebSocket para transmisión continua de datos.
 
-### Simulador IoT (`simulador.py`)
-Script autónomo que emula el envío de métricas de tres tipos de sensores simultáneos (`t001` de temperatura, `h001` de humedad y `l001` de luminosidad). Incorpora manejo de marcas temporales con zonas horarias (`timezone.utc`) e inyecta estados de batería aleatorios.
+### 2. Módulo de Autenticación (`login.py`)
+Componente de Reflex que implementa una interfaz fluida para:
+- **Iniciar sesión** verificando hashes SHA-256 en la base de datos.
+- **Registro de nuevos usuarios** asignando roles por defecto.
+- **Gestión de estado persistente** mediante `rx.LocalStorage` para mantener la sesión del usuario.
+- Visibilidad alternable para el campo de contraseña.
 
-### Base de Datos (`agrotech.db`)
-Base de datos SQLite embebida que contiene el modelo de datos relacional del proyecto:
-- `users`: Gestión de usuarios y roles.
+### 3. Panel Web Dashboard (`panel_web.py`)
+Dashboard interactivo construido íntegramente en Python mediante Reflex. Incluye:
+- **Control de barrera de acceso**: Redirige al login si no se detecta sesión activa.
+- **Visualización en tiempo real**: Tarjetas circulares con métricas en vivo (Temperatura, Humedad, Luz, pH).
+- **Mecanismo de auto-refresco**: *Polling* dinámico en JavaScript (cada 5 segundos).
+- **Diseño limpio**: Semántica de colores pastel adaptados según los umbrales de lectura y soporte para modo claro/oscuro.
+
+### 4. Simulador IoT (`simulador.py`)
+Script autónomo que emula el envío de métricas de sensores (`t001` de temperatura, `h001` de humedad y `l001` de luminosidad). Incorpora manejo de marcas temporales con zonas horarias (`timezone.utc`) e inyecta estados de batería aleatorios.
+
+### 5. Script de Orquestación (`arrancar.py`)
+Permite lanzar simultáneamente la API, el simulador de datos y el panel web de Reflex en subprocesos independientes, gestionando la parada limpia de todos los servicios mediante `Ctrl+C`.
+
+### 6. Base de Datos (`agrotech.db`)
+Base de datos SQLite embebida que contiene el modelo relacional del proyecto:
+- `users`: Gestión de usuarios, roles y contraseñas hasheadas (`password_hash`).
 - `parcels`: Información geográfica de las parcelas.
 - `sensors`: Catálogo de sensores, tipo de métrica, unidades y umbrales de alerta.
 - `sensor_data`: Histórico detallado de lecturas registradas.
 - `alerts`: Registro de incidencias y estado de confirmación.
 
-### Panel Web Reactivo (`panel_web.py`)
-Dashboard interactivo construido íntegramente en Python mediante Reflex. Incluye un mecanismo de actualización en tiempo real mediante *polling* dinámico en JavaScript (cada 5 segundos), semántica de colores pastel según el nivel de lectura y soporte para modo claro/oscuro.
-
 ## Tecnologías Utilizadas
 
 - **Lenguaje**: Python 3.10+
 - **Backend**: FastAPI, Uvicorn, Pydantic, WebSockets
-- **Frontend**: Reflex
+- **Frontend**: Reflex (Componentes UI y gestión de estado con React/Next.js subyacente)
 - **Base de Datos**: SQLite3
+- **Seguridad**: Hashlib (SHA-256)
 - **Librerías auxiliares**: Requests
 - **Control de versiones**: Git, GitHub
 
@@ -47,10 +63,12 @@ Dashboard interactivo construido íntegramente en Python mediante Reflex. Incluy
 
 ```text
 RetoAgrotech/
-├── api.py               # API REST, configuración WebSockets y esquema SQLite
+├── arrancar.py          # Script principal para iniciar todos los servicios a la vez
+├── api.py               # API REST, autenticación backend y esquema SQLite
 ├── simulador.py         # Simulador de sensores IoT (temperatura, humedad, luz)
-├── panel_web.py         # Dashboard frontend con Reflex y visualización reactiva
-├── agrotech.db          # Base de datos relacional SQLite (se autogenera)
+├── login.py             # Pantalla de Login/Registro y gestión de estado de autenticación
+├── panel_web.py         # Dashboard principal con tablas, métricas y control de acceso
+├── agrotech.db          # Base de datos relacional SQLite (se autogenera al iniciar)
 ├── entorno_agrotech/    # Entorno virtual de Python (.venv)
 ├── README.md            # Documentación del proyecto
 └── LICENSE              # Licencia GPLv3
@@ -67,9 +85,9 @@ sudo apt update
 sudo apt install python3-pip python3-venv -y
 ```
 
-### 2. Preparar el proyecto y el entorno virtual
+### 2. Preparar el entorno virtual
 
-Clona o abre el directorio del proyecto y crea el entorno virtual de trabajo:
+Clona o abre el directorio del proyecto y activa el entorno virtual:
 
 ```bash
 python3 -m venv entorno_agrotech
@@ -80,7 +98,7 @@ Al activarse, verás el prefijo `(entorno_agrotech)` en la consola.
 
 ### 3. Instalar librerías de Python
 
-Instala los módulos requeridos para la API, el simulador y el panel web:
+Instala los módulos requeridos:
 
 ```bash
 pip install fastapi uvicorn requests reflex
@@ -94,50 +112,56 @@ reflex init
 
 ## Cómo Ejecutar el Sistema
 
-Para ejecutar la solución completa se requieren **tres terminales abiertas**, todas con el entorno virtual activado.
+### Opción A: Modo Simplificado (Recomendado)
 
-### Terminal 1: Servidor API REST (Puerto 8001)
+Puedes arrancar todo el sistema (API + Simulador + Panel Web) con un solo comando gracias al script `arrancar.py`:
 
-Ejecuta FastAPI especificando el puerto 8001 (el cual espera el simulador):
+```bash
+source entorno_agrotech/bin/activate
+python3 arrancar.py
+```
 
+- La API estará en: `http://localhost:8001`
+- El Panel Web estará accesible en: `http://localhost:3000`
+- Credenciales por defecto del administrador: **Usuario:** `admin` | **Contraseña:** `admin123`
+- Para detener todos los servicios pulsa `Ctrl+C` en la terminal.
+
+---
+
+### Opción B: Ejecución Manual en Terminales Separadas
+
+Si prefieres monitorear los logs de cada servicio por separado, abre tres terminales con el entorno virtual activado:
+
+#### Terminal 1: Servidor API REST (Puerto 8001)
 ```bash
 source entorno_agrotech/bin/activate
 uvicorn api:app --port 8001 --reload
 ```
+*Documentación Swagger interactiva accesible en `http://localhost:8001/docs`.*
 
-*Nota: La documentación Swagger interactiva estará accesible en `http://localhost:8001/docs`.*
-
-### Terminal 2: Simulador de Sensores
-
-Inicia el generador de datos para comenzar a enviar métricas a la API cada 5 segundos:
-
+#### Terminal 2: Simulador de Sensores
 ```bash
 source entorno_agrotech/bin/activate
 python3 simulador.py
 ```
 
-### Terminal 3: Panel Web Dashboard (Reflex)
-
-Despliega la aplicación web de Reflex:
-
+#### Terminal 3: Panel Web Dashboard (Reflex)
 ```bash
 source entorno_agrotech/bin/activate
 reflex run
 ```
 
-El panel estará disponible en tu navegador en `http://localhost:3000`.
-
 ## Referencia de Endpoints API
 
 | Método | Endpoint | Descripción |
 | :--- | :--- | :--- |
-| `POST` | `/api/auth/login` | Simulación de autenticación JWT |
+| `POST` | `/api/auth/login` | Validación de credenciales con hash SHA-256 |
 | `GET` | `/api/parcels` | Lista de parcelas registradas |
 | `GET` | `/api/parcels/{id}/sensors` | Lista de sensores asociados a una parcela |
-| `POST` | `/api/sensors/{sensor_id}/data` | Recepción e ingesta de lecturas enviadas por los sensores |
-| `GET` | `/api/sensors/{sensor_id}/data` | Consulta histórica de lecturas con filtros opcionales (`from`, `to`, `limit`) |
+| `POST` | `/api/sensors/{sensor_id}/data` | Ingesta de lecturas enviadas por los sensores |
+| `GET` | `/api/sensors/{sensor_id}/data` | Consulta histórica de lecturas (`from`, `to`, `limit`) |
 | `GET` | `/api/dashboard` | Estado general del servicio |
-| `WS` | `/ws/parcels/{id}` | Endpoint WebSocket para transmisión continua |
+| `WS` | `/ws/parcels/{id}` | WebSocket para transmisión continua |
 
 ### Ejemplo de Payload enviado por un sensor (`POST`)
 
@@ -152,10 +176,10 @@ El panel estará disponible en tu navegador en `http://localhost:3000`.
 
 ## Próximas Mejoras
 
-- [ ] Implementar autenticación real mediante tokens JWT persistidos en el cliente.
-- [ ] Integrar gráficas de líneas reactivas (`rx.recharts`) en la pestaña de lecturas en vivo del dashboard.
+- [ ] Implementar autenticación real mediante tokens JWT firmados.
+- [ ] Integrar gráficas temporales de líneas (`rx.recharts`) en la vista del dashboard.
 - [ ] Añadir panel de control para la confirmación de alertas en tiempo real (`acknowledged`).
-- [ ] Dockerizar la aplicación mediante un archivo `docker-compose.yml` para simplificar la ejecución con un solo comando.
+- [ ] Contenedorización mediante un archivo `docker-compose.yml` para despliegue en producción.
 
 ## Licencia
 
