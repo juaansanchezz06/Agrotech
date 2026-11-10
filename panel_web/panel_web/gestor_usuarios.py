@@ -1,24 +1,30 @@
 import reflex as rx
 import sqlite3
 import os
-import hashlib
-from .login import BaseState
+from .login import BaseState, hashear_contrasena
 
 DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
 RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
 
-# 1. ESTADO DEL GESTOR
 class GestorUsuariosState(BaseState):
     usuarios_registrados: list[list[str]] = []
     
-    # Variables de los formularios
     input_usuario: str = ""
     input_contrasena: str = ""
     input_rol: str = "usuario"
     
-    # Mensajes
     error_mensaje: str = ""
     exito_mensaje: str = ""
+
+    # Setters explícitos recuperados para evitar el AttributeError
+    def set_input_usuario(self, valor: str):
+        self.input_usuario = valor
+
+    def set_input_contrasena(self, valor: str):
+        self.input_contrasena = valor
+
+    def set_input_rol(self, valor: str):
+        self.input_rol = valor
 
     def limpiar_formularios(self):
         self.input_usuario = ""
@@ -37,7 +43,6 @@ class GestorUsuariosState(BaseState):
                 cursor.execute("SELECT role FROM users WHERE username = ?", (self.usuario_actual,))
                 resultado = cursor.fetchone()
                 
-                # Si no existe o no es administrador, lo echamos al panel
                 if not resultado or resultado[0] != "administrador":
                     return rx.redirect("/panel")
         except sqlite3.Error:
@@ -70,7 +75,7 @@ class GestorUsuariosState(BaseState):
                     self.error_mensaje = "El usuario ya existe."
                     return
                 
-                pass_hash = hashlib.sha256(self.input_contrasena.encode('utf-8')).hexdigest()
+                pass_hash = hashear_contrasena(self.input_contrasena)
                 cursor.execute(
                     "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
                     (self.input_usuario, pass_hash, self.input_rol)
@@ -98,7 +103,7 @@ class GestorUsuariosState(BaseState):
                     self.error_mensaje = "El usuario no existe."
                     return
                 
-                pass_hash = hashlib.sha256(self.input_contrasena.encode('utf-8')).hexdigest()
+                pass_hash = hashear_contrasena(self.input_contrasena)
                 cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (pass_hash, self.input_usuario))
                 conexion.commit()
                 self.exito_mensaje = f"Contraseña de '{self.input_usuario}' actualizada."
@@ -138,8 +143,6 @@ class GestorUsuariosState(BaseState):
         except sqlite3.Error as e:
             self.error_mensaje = f"Error al borrar: {e}"
 
-
-# 2. INTERFAZ
 def fila_usuario(fila: list[str]) -> rx.Component:
     return rx.table.row(
         rx.table.cell(rx.text(fila[0], weight="bold", color="var(--gray-12)")),
@@ -177,7 +180,6 @@ def panel_gestor_usuarios() -> rx.Component:
             </style>
         """),
         
-        # NAVBAR SIMPLE
         rx.hstack(
             rx.hstack(
                 rx.icon(tag="shield-alert", color="crimson", size=30),
@@ -205,9 +207,7 @@ def panel_gestor_usuarios() -> rx.Component:
             background_color="var(--gray-2)"
         ),
         
-        # CONTENIDO PRINCIPAL
         rx.hstack(
-            # COLUMNA IZQUIERDA: Tabla de usuarios actuales
             rx.vstack(
                 rx.heading("Usuarios Registrados", size="5", color="var(--gray-12)"),
                 rx.card(
@@ -228,17 +228,14 @@ def panel_gestor_usuarios() -> rx.Component:
                 spacing="4"
             ),
             
-            # COLUMNA DERECHA: Controles de administración
             rx.vstack(
                 rx.heading("Acciones Administrativas", size="5", color="var(--gray-12)"),
                 
-                # Mensajes
                 rx.cond(GestorUsuariosState.error_mensaje != "",
                     rx.callout.root(rx.callout.icon("alert-triangle"), rx.callout.text(GestorUsuariosState.error_mensaje), color_scheme="red", width="100%")),
                 rx.cond(GestorUsuariosState.exito_mensaje != "",
                     rx.callout.root(rx.callout.icon("check-circle"), rx.callout.text(GestorUsuariosState.exito_mensaje), color_scheme="grass", width="100%")),
                 
-                # Pestañas de Acciones
                 rx.tabs.root(
                     rx.tabs.list(
                         rx.tabs.trigger("Añadir", value="add"),
@@ -247,7 +244,6 @@ def panel_gestor_usuarios() -> rx.Component:
                         width="100%"
                     ),
                     
-                    # 1. AÑADIR
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(
@@ -260,7 +256,6 @@ def panel_gestor_usuarios() -> rx.Component:
                         ), value="add"
                     ),
                     
-                    # 2. CAMBIAR CLAVE
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(
@@ -273,7 +268,6 @@ def panel_gestor_usuarios() -> rx.Component:
                         ), value="pass"
                     ),
                     
-                    # 3. BORRAR
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(

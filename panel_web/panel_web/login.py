@@ -1,12 +1,29 @@
 import reflex as rx   
 import sqlite3   
 import os   
-import hashlib   
+import hashlib
+import secrets 
    
 DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))   
 RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")   
+
+# --- FUNCIONES DE SEGURIDAD (PBKDF2 + Salt) ---
+def hashear_contrasena(password: str) -> str:
+    salt = os.urandom(16)
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 600000)
+    return f"{salt.hex()}${pwd_hash.hex()}"
+
+def verificar_contrasena(password: str, hash_almacenado: str) -> bool:
+    try:
+        salt_hex, pwd_hash_hex = hash_almacenado.split('$')
+        salt = bytes.fromhex(salt_hex)
+        pwd_hash = bytes.fromhex(pwd_hash_hex)
+        new_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 600000)
+        return secrets.compare_digest(new_hash, pwd_hash)
+    except (ValueError, AttributeError):
+        return False
+# ----------------------------------------------
    
-# 1. ESTADO GLOBAL   
 class BaseState(rx.State):   
     usuario_actual: str = rx.LocalStorage("")   
    
@@ -14,7 +31,6 @@ class BaseState(rx.State):
         self.usuario_actual = ""   
         return rx.redirect("/")   
    
-# 2. ESTADO DEL LOGIN
 class LoginState(BaseState):   
     usuario: str = ""   
     contrasena: str = ""   
@@ -38,8 +54,11 @@ class LoginState(BaseState):
    
     def validar_login(self):   
         self.error_mensaje = ""   
+        
+        usr = self.usuario.strip()
+        pwd = self.contrasena.strip()
             
-        if not self.usuario or not self.contrasena:   
+        if not usr or not pwd:   
             self.error_mensaje = "Por favor, rellena todos los campos."   
             return   
    
@@ -55,34 +74,50 @@ class LoginState(BaseState):
                   
                 cursor.execute("SELECT id FROM users WHERE username = 'admin'")
                 if not cursor.fetchone():
-                    admin_hash = hashlib.sha256("admin123".encode('utf-8')).hexdigest()   
+                    admin_hash = hashear_contrasena("admin123")   
                     cursor.execute(  
                         "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",   
                         ('admin', admin_hash, 'administrador')  
                     )   
                 conexion.commit()   
    
-                pass_hash = hashlib.sha256(self.contrasena.encode('utf-8')).hexdigest()  
-   
-                cursor.execute(   
-                    "SELECT id FROM users WHERE username = ? AND password_hash = ?",     
-                    (self.usuario, pass_hash)   
-                )   
+                cursor.execute("SELECT password_hash FROM users WHERE username = ?", (usr,))
+                resultado = cursor.fetchone()
+                
+                if resultado:
+                    hash_bd = resultado[0]
                     
-                if cursor.fetchone():   
-                    self.usuario_actual = self.usuario     
-                    self.limpiar_campos()
-                    return rx.redirect("/panel")     
+                    if verificar_contrasena(pwd, hash_bd):
+                        self.usuario_actual = usr     
+                        self.limpiar_campos()
+                        return rx.redirect("/panel")
+                        
+                    elif hash_bd == pwd:
+                        nuevo_hash = hashear_contrasena(pwd)
+                        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (nuevo_hash, usr))
+                        conexion.commit()
+                        self.usuario_actual = usr
+                        self.limpiar_campos()
+                        return rx.redirect("/panel")
+                        
+                    elif hash_bd == hashlib.sha256(pwd.encode('utf-8')).hexdigest():
+                        nuevo_hash = hashear_contrasena(pwd)
+                        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (nuevo_hash, usr))
+                        conexion.commit()
+                        self.usuario_actual = usr
+                        self.limpiar_campos()
+                        return rx.redirect("/panel")
+
+                    else:
+                        self.error_mensaje = "Usuario o contraseña incorrectos."
                 else:   
                     self.error_mensaje = "Usuario o contraseña incorrectos."   
                         
         except sqlite3.Error as e:   
             self.error_mensaje = f"Error de base de datos: {e}"   
    
-# 3. INTERFAZ    
 def login_page() -> rx.Component:   
     return rx.box(   
-        # INYECCIÓN DE LA NUEVA PALETA DE COLORES DEL PANEL_WEB
         rx.html("""
             <style>
                 :root, .light, .light-theme {
@@ -105,7 +140,6 @@ def login_page() -> rx.Component:
                     --gray-12: #E2F1F5 !important;
                 }
 
-                /* Aplicar color dinámico a los inputs (el placeholder en un tono más suave) */
                 html body .rt-TextFieldRoot .rt-TextFieldInput::placeholder,
                 html body .rt-TextFieldInput::placeholder {
                     color: var(--gray-11) !important;
@@ -120,7 +154,6 @@ def login_page() -> rx.Component:
             </style>
         """),
         
-        # --- BOTÓN MODO OSCURO/CLARO FLOTANTE ---
         rx.box(
             rx.color_mode.button(),
             position="absolute",
@@ -132,7 +165,6 @@ def login_page() -> rx.Component:
         rx.center(   
             rx.card(   
                 rx.vstack(   
-                    # --- CABECERA ---
                     rx.center(   
                         rx.icon(tag="lock", size=40, color="var(--grass-9)"),  
                         rx.heading("Acceso Agrotech", size="6", margin_top="1em", color="var(--gray-12)"),  
@@ -140,7 +172,6 @@ def login_page() -> rx.Component:
                         width="100%"    
                     ),    
                     
-                    # --- BARRA DE USUARIO ---
                     rx.text("Usuario", weight="bold", size="2", color="var(--gray-12)"),    
                     rx.input(
                         rx.input.slot(rx.icon("user", size=18, color="var(--gray-11)")),
@@ -154,7 +185,6 @@ def login_page() -> rx.Component:
                         background_color="var(--gray-1)"
                     ),    
                     
-                    # --- BARRA DE CONTRASEÑA ---
                     rx.text("Contraseña", weight="bold", size="2", margin_top="1em", color="var(--gray-12)"),    
                     rx.input(
                         rx.input.slot(rx.icon("lock", size=18, color="var(--gray-11)")),
@@ -178,7 +208,6 @@ def login_page() -> rx.Component:
                         background_color="var(--gray-1)"
                     ),
                         
-                    # --- MENSAJES DE ALERTA ---
                     rx.cond(   
                         LoginState.error_mensaje != "",   
                         rx.callout.root(   
@@ -188,7 +217,6 @@ def login_page() -> rx.Component:
                         )   
                     ),   
                         
-                    # --- BOTÓN DE ACCIÓN PRINCIPAL ---
                     rx.button("Entrar", on_click=LoginState.validar_login, color_scheme="grass", width="100%", margin_top="2em", size="3"),  
                       
                     width="100%", align_items="start", padding="2em"    
