@@ -8,7 +8,7 @@ histórica mediante gráficas, las tablas de catálogo y el enrutamiento general
   1. Importaciones y configuración global (rutas de BD y diccionarios de mapeo).
   2. Estado principal (EstadoAgrotech): lógica de negocio, SQLite y WebSockets.
   3. Componentes de métricas en tiempo real (tarjetas circulares por parcela).
-  4. Componente de gráfica histórica (filtros, cálculo de media y Recharts).
+  4. Componente de gráfica histórica (filtros por fecha, zoom y Recharts).
   5. Componentes de tablas reutilizables (parcelas, sensores y lecturas).
   6. Interfaz principal (index): estilos CSS, barra de navegación y pestañas.
   7. Configuración de la aplicación y registro de rutas.
@@ -20,7 +20,7 @@ import os
 import json
 import asyncio
 import websockets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, List, Dict
 
 # Importación de vistas y estados secundarios.
@@ -97,8 +97,10 @@ class EstadoAgrotech(BaseState):
     datos_grafica: List[Dict[str, Any]] = []
     grafica_parcela: str = "Parcela Norte"
     grafica_tipo: str = "temperaturaAmb"
-    grafica_limite: str = "50"
+    grafica_fecha_inicio: str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    grafica_fecha_fin: str = datetime.now().strftime("%Y-%m-%d")
     valor_medio: str = "0.0"  # Se guarda como str porque ReferenceLine.y de Recharts exige str | int
+    zoom_grafica: int = 100   # Nivel de ampliación en porcentaje (100% = sin scroll horizontal)
 
     # Opciones disponibles en los desplegables de filtrado de la gráfica
     opciones_parcelas: list[str] = [
@@ -115,7 +117,43 @@ class EstadoAgrotech(BaseState):
         "temperaturaSuelo",
         "ph"
     ]
-    opciones_limites: list[str] = ["10", "20", "30", "50"]
+
+    @rx.var
+    def ancho_grafica(self) -> str:
+        """Devuelve el ancho CSS de la gráfica según el nivel de zoom activo."""
+        return f"{self.zoom_grafica}%"
+
+    def aumentar_zoom_grafica(self):
+        """Amplía la anchura de la gráfica un 50% (hasta un máximo de 400%)."""
+        if self.zoom_grafica < 400:
+            self.zoom_grafica += 50
+            return rx.call_script("window.dispatchEvent(new Event('resize'));")
+
+    def reducir_zoom_grafica(self):
+        """
+        Reduce la anchura de la gráfica un 50% (hasta el 100% base) y reajusta
+        el desplazamiento horizontal para que nunca quede bloqueado a la derecha.
+        """
+        if self.zoom_grafica > 100:
+            self.zoom_grafica -= 50
+            if self.zoom_grafica <= 100:
+                return rx.call_script("""
+                    const el = document.getElementById('scroll-grafica');
+                    if (el) { el.scrollLeft = 0; }
+                    window.dispatchEvent(new Event('resize'));
+                    requestAnimationFrame(() => {
+                        const el2 = document.getElementById('scroll-grafica');
+                        if (el2) { el2.scrollLeft = 0; }
+                    });
+                """)
+            return rx.call_script("""
+                const el = document.getElementById('scroll-grafica');
+                if (el) {
+                    const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth);
+                    if (el.scrollLeft > maxScroll) { el.scrollLeft = maxScroll; }
+                }
+                window.dispatchEvent(new Event('resize'));
+            """)
 
     def comprobar_acceso(self):
         """
@@ -156,14 +194,27 @@ class EstadoAgrotech(BaseState):
         self.grafica_tipo = valor
         self.actualizar_grafica()
 
-    def set_grafica_limite(self, valor: str):
-        self.grafica_limite = valor
+    def set_grafica_fecha_inicio(self, valor: str):
+        """Actualiza la fecha inicial impidiendo que sea posterior a la fecha final."""
+        if valor and self.grafica_fecha_fin and valor > self.grafica_fecha_fin:
+            self.grafica_fecha_inicio = self.grafica_fecha_fin
+        else:
+            self.grafica_fecha_inicio = valor
+        self.actualizar_grafica()
+
+    def set_grafica_fecha_fin(self, valor: str):
+        """Actualiza la fecha final impidiendo que sea anterior a la fecha inicial."""
+        if valor and self.grafica_fecha_inicio and valor < self.grafica_fecha_inicio:
+            self.grafica_fecha_fin = self.grafica_fecha_inicio
+        else:
+            self.grafica_fecha_fin = valor
         self.actualizar_grafica()
 
     def actualizar_grafica(self):
         """
-        Consulta en SQLite las últimas N lecturas del sensor seleccionado en los filtros,
-        las ordena cronológicamente y calcula el valor medio para la línea de referencia.
+        Consulta en SQLite las lecturas del sensor seleccionado dentro del rango
+        de fechas elegido por el usuario, las ordena cronológicamente y calcula
+        el valor medio para la línea de referencia.
         """
         try:
             with sqlite3.connect(RUTA_DB) as conexion:
@@ -174,28 +225,51 @@ class EstadoAgrotech(BaseState):
                 s_suffix = MAPA_TIPOS.get(self.grafica_tipo, "temp_amb")
                 target_sensor_id = f"p{p_id}_{s_suffix}"
 
-                # Obtiene los últimos registros y los invierte para pintarlos de izquierda a derecha
-                query = """
+                # Construye la consulta filtrando por rango de fechas (YYYY-MM-DD)
+                condiciones = ["sensor_id = ?"]
+                parametros: list[Any] = [target_sensor_id]
+
+                if self.grafica_fecha_inicio:
+                    condiciones.append("substr(timestamp, 1, 10) >= ?")
+                    parametros.append(self.grafica_fecha_inicio)
+
+                if self.grafica_fecha_fin:
+                    condiciones.append("substr(timestamp, 1, 10) <= ?")
+                    parametros.append(self.grafica_fecha_fin)
+
+                query = f"""
                     SELECT timestamp, value
                     FROM sensor_data
-                    WHERE sensor_id = ?
-                    ORDER BY id DESC LIMIT ?
+                    WHERE {' AND '.join(condiciones)}
+                    ORDER BY id ASC
                 """
-                cursor.execute(query, (target_sensor_id, int(self.grafica_limite)))
-                datos_raw = list(reversed(cursor.fetchall()))
+                cursor.execute(query, tuple(parametros))
+                datos_raw = cursor.fetchall()
 
                 grafica_formateada = []
                 suma = 0.0
+                mismo_dia = (
+                    bool(self.grafica_fecha_inicio)
+                    and self.grafica_fecha_inicio == self.grafica_fecha_fin
+                )
 
                 for fila in datos_raw:
-                    # Extrae únicamente la hora (HH:MM:SS) de la marca temporal ISO
                     fecha_cruda_g = str(fila[0]) if fila[0] else ""
-                    hora = fecha_cruda_g[11:19] if len(fecha_cruda_g) >= 19 else fecha_cruda_g
+                    if len(fecha_cruda_g) >= 19:
+                        if mismo_dia:
+                            # Si es un solo día, mostramos HH:MM:SS
+                            etiqueta_tiempo = fecha_cruda_g[11:19]
+                        else:
+                            # Si abarca varios días, mostramos DD/MM HH:MM
+                            etiqueta_tiempo = f"{fecha_cruda_g[8:10]}/{fecha_cruda_g[5:7]} {fecha_cruda_g[11:16]}"
+                    else:
+                        etiqueta_tiempo = fecha_cruda_g
+
                     valor_g = float(fila[1]) if fila[1] is not None else 0.0
 
                     suma += valor_g
                     grafica_formateada.append({
-                        "hora": hora,
+                        "hora": etiqueta_tiempo,
                         "Valor": valor_g
                     })
 
@@ -218,7 +292,6 @@ class EstadoAgrotech(BaseState):
         """
         async with self:
             id_parcela = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
-            # Evita abrir un segundo hilo si ya estamos escuchando esa misma parcela
             if self._id_streaming_actual == id_parcela:
                 return
             self._id_streaming_actual = id_parcela
@@ -228,14 +301,12 @@ class EstadoAgrotech(BaseState):
         try:
             async with websockets.connect(uri) as websocket:
                 while True:
-                    # Si el usuario cambió de parcela, detenemos este bucle antiguo
                     async with self:
                         if self._id_streaming_actual != id_parcela:
                             break
 
                     mensaje = await websocket.recv()
 
-                    # Al recibir notificación del servidor, actualizamos los datos en pantalla
                     async with self:
                         self.obtener_datos()
 
@@ -415,18 +486,67 @@ def vista_boceto_parcelas() -> rx.Component:
 def vista_grafica() -> rx.Component:
     """
     Tarjeta de la pestaña 'Evolución (Gráfica)':
-      - 3 selectores de filtro (Parcela, Métrica y Límite de lecturas).
-      - Indicador numérico de la media del periodo.
-      - Gráfica lineal Recharts con línea de media y scroll horizontal para 50 puntos.
+      - Selectores de Parcela, Métrica y rango de fechas (Desde / Hasta) validado.
+      - Controles de zoom (+ / -) con scroll horizontal adaptativo y auto-centrado al 100%.
+      - Gráfica lineal Recharts con alto contraste en modo claro y oscuro.
     """
     return rx.card(
         rx.vstack(
-            rx.heading("Evolución de Métricas", size="4", color="var(--gray-12)"),
-            rx.text(
-                "Filtra los datos históricos por parcela y tipo de métrica",
-                size="2",
-                color="var(--gray-11)",
-                margin_bottom="1em"
+            # Cabecera con título y controles de zoom (+ / -)
+            rx.hstack(
+                rx.vstack(
+                    rx.heading("Evolución de Métricas", size="4", color="var(--gray-12)"),
+                    rx.text(
+                        "Filtra los datos históricos por parcela, métrica y rango de fechas",
+                        size="2",
+                        color="var(--gray-11)",
+                    ),
+                    align="start",
+                    spacing="1",
+                ),
+                rx.spacer(),
+                rx.hstack(
+                    rx.text("Zoom:", size="2", weight="medium", color="var(--gray-11)"),
+                    rx.icon_button(
+                        rx.icon("minus", size=16),
+                        on_click=EstadoAgrotech.reducir_zoom_grafica,
+                        disabled=EstadoAgrotech.zoom_grafica <= 100,
+                        variant="soft",
+                        color_scheme="grass",
+                        size="2",
+                        cursor=rx.cond(EstadoAgrotech.zoom_grafica <= 100, "not-allowed", "pointer"),
+                        title="Desampliar gráfica",
+                    ),
+                    rx.text(
+                        EstadoAgrotech.ancho_grafica,
+                        size="2",
+                        weight="bold",
+                        color="var(--gray-12)",
+                        min_width="3.5em",
+                        text_align="center",
+                    ),
+                    rx.icon_button(
+                        rx.icon("plus", size=16),
+                        on_click=EstadoAgrotech.aumentar_zoom_grafica,
+                        disabled=EstadoAgrotech.zoom_grafica >= 400,
+                        variant="soft",
+                        color_scheme="grass",
+                        size="2",
+                        cursor=rx.cond(EstadoAgrotech.zoom_grafica >= 400, "not-allowed", "pointer"),
+                        title="Ampliar gráfica",
+                    ),
+                    padding="0.35em 0.6em",
+                    border_radius="12px",
+                    background_color="var(--gray-3)",
+                    border="1px solid var(--gray-5)",
+                    align="center",
+                    spacing="2",
+                ),
+                width="100%",
+                align="center",
+                wrap="wrap",
+                spacing="3",
+                margin_bottom="1em",
             ),
 
             # Barra de filtros de la gráfica
@@ -452,12 +572,26 @@ def vista_grafica() -> rx.Component:
                     align="start"
                 ),
                 rx.vstack(
-                    rx.text("Últimas lecturas", size="1", weight="bold", color="var(--gray-12)"),
-                    rx.select(
-                        EstadoAgrotech.opciones_limites,
-                        value=EstadoAgrotech.grafica_limite,
-                        on_change=EstadoAgrotech.set_grafica_limite,
-                        variant="soft"
+                    rx.text("Desde", size="1", weight="bold", color="var(--gray-12)"),
+                    rx.input(
+                        type="date",
+                        value=EstadoAgrotech.grafica_fecha_inicio,
+                        max=EstadoAgrotech.grafica_fecha_fin,
+                        on_change=EstadoAgrotech.set_grafica_fecha_inicio,
+                        variant="soft",
+                        color_scheme="grass",
+                    ),
+                    align="start"
+                ),
+                rx.vstack(
+                    rx.text("Hasta", size="1", weight="bold", color="var(--gray-12)"),
+                    rx.input(
+                        type="date",
+                        value=EstadoAgrotech.grafica_fecha_fin,
+                        min=EstadoAgrotech.grafica_fecha_inicio,
+                        on_change=EstadoAgrotech.set_grafica_fecha_fin,
+                        variant="soft",
+                        color_scheme="grass",
                     ),
                     align="start"
                 ),
@@ -469,48 +603,79 @@ def vista_grafica() -> rx.Component:
 
             # Resumen del valor medio calculado
             rx.hstack(
-                rx.text("Media actual:", size="2", color="var(--gray-11)"),
+                rx.text("Media del periodo:", size="2", color="var(--gray-11)"),
                 rx.text(EstadoAgrotech.valor_medio, size="3", weight="bold", color="var(--grass-11)"),
                 align="center",
                 spacing="2",
-                margin_bottom="1em",
+                margin_bottom="1.2em",
             ),
 
-            # Contenedor con desplazamiento horizontal para evitar solapamiento de etiquetas
+            # Contenedor con scroll horizontal adaptativo (sin scroll y reseteado al 100%)
             rx.box(
-                rx.recharts.line_chart(
-                    rx.recharts.line(
-                        data_key="Valor",
-                        stroke="#82b1ff",
-                        stroke_width=3,
-                        dot=True,
+                rx.box(
+                    rx.recharts.line_chart(
+                        rx.recharts.cartesian_grid(
+                            stroke_dasharray="3 3",
+                            stroke="var(--gray-5)",
+                        ),
+                        rx.recharts.line(
+                            data_key="Valor",
+                            stroke="#64B5F6",
+                            stroke_width=3,
+                            dot={"fill": "#64B5F6", "stroke": "var(--gray-12)", "strokeWidth": 1, "r": 4},
+                            active_dot={"r": 6, "fill": "var(--grass-9)", "stroke": "var(--gray-12)"},
+                        ),
+                        # Línea horizontal discontinua que marca la media
+                        rx.recharts.reference_line(
+                            y=EstadoAgrotech.valor_medio,
+                            stroke="var(--grass-9)",
+                            stroke_dasharray="4 4",
+                            stroke_width=2,
+                        ),
+                        rx.recharts.x_axis(
+                            data_key="hora",
+                            stroke="var(--gray-6)",
+                            tick={"fill": "var(--gray-12)", "fontSize": 12},
+                        ),
+                        rx.recharts.y_axis(
+                            domain=["auto", "auto"],
+                            stroke="var(--gray-6)",
+                            tick={"fill": "var(--gray-12)", "fontSize": 12},
+                        ),
+                        rx.recharts.graphing_tooltip(
+                            content_style={
+                                "backgroundColor": "var(--gray-3)",
+                                "borderColor": "var(--gray-5)",
+                                "borderRadius": "10px",
+                                "color": "var(--gray-12)",
+                            },
+                            label_style={"color": "var(--gray-12)", "fontWeight": "bold"},
+                            item_style={"color": "#64B5F6", "fontWeight": "bold"},
+                        ),
+                        data=EstadoAgrotech.datos_grafica,
+                        height=320,
+                        width="100%",
                     ),
-                    # Línea horizontal discontinua que marca la media
-                    rx.recharts.reference_line(
-                        y=EstadoAgrotech.valor_medio,
-                        stroke="var(--grass-9)",
-                        stroke_dasharray="3 3",
-                    ),
-                    rx.recharts.x_axis(data_key="hora"),
-                    rx.recharts.y_axis(domain=["auto", "auto"]),
-                    rx.recharts.graphing_tooltip(),
-                    data=EstadoAgrotech.datos_grafica,
-                    height=320,
-                    width="100%",
-                    min_width="1200px",
+                    width=EstadoAgrotech.ancho_grafica,
+                    min_width="100%",
+                    overflow="hidden",
                 ),
+                id="scroll-grafica",
                 width="100%",
-                overflow_x="auto",
-                padding_bottom="1em"
+                min_width="0",
+                overflow_x=rx.cond(EstadoAgrotech.zoom_grafica > 100, "auto", "hidden"),
+                padding_bottom="0.75em",
             ),
             width="100%",
+            padding="0.35em",
         ),
         width="100%",
+        padding="2em",
         border="1px solid var(--gray-5)",
         background_color="var(--gray-2)",
         box_shadow="0 4px 12px rgba(0, 0, 0, 0.03)",
         border_radius="16px",
-        margin_top="1em"
+        margin_top="1.5em",
     )
 
 
@@ -598,6 +763,7 @@ def index() -> rx.Component:
         rx.html("""
             <style>
                 :root, .light, .light-theme {
+                    color-scheme: light;
                     --gray-1: #F4F7F8 !important;
                     --gray-2: #EBF0F2 !important;
                     --gray-3: #E1E8EC !important;
@@ -607,14 +773,15 @@ def index() -> rx.Component:
                     --gray-12: #1A2E35 !important;
                 }
                 .dark, .dark-theme, [data-theme="dark"] {
+                    color-scheme: dark;
                     --gray-1: #0D2F3A !important;
                     --gray-2: #09242E !important;
                     --gray-3: #123C4A !important;
                     --gray-4: #174859 !important;
                     --gray-5: #1D566B !important;
-                    --gray-6: #24657D !important;
-                    --gray-11: #8FB4C2 !important;
-                    --gray-12: #E2F1F5 !important;
+                    --gray-6: #2A718B !important;
+                    --gray-11: #B8D4DF !important;
+                    --gray-12: #F0F8FA !important;
                 }
             </style>
         """),
@@ -710,25 +877,13 @@ def index() -> rx.Component:
 
         # --- CONTENEDOR CENTRAL DEL DASHBOARD ---
         rx.vstack(
-            # Cabecera de sección e indicador visual de WebSocket activo
+            # Cabecera de sección
             rx.hstack(
                 rx.vstack(
                     rx.heading("Monitorización y Catálogo", size="7", weight="bold", color="var(--gray-12)"),
                     rx.text("Visualiza las parcelas, sensores y los datos en tiempo real.", color="var(--gray-11)", size="2"),
                     align_items="start",
                     spacing="1"
-                ),
-                rx.spacer(),
-
-                rx.hstack(
-                    rx.box(width="8px", height="8px", border_radius="50%", background_color="var(--grass-9)"),
-                    rx.text("Transmisión en Vivo", size="2", weight="medium", color="var(--grass-11)"),
-                    padding="0.4em 0.9em",
-                    border_radius="20px",
-                    border="1px solid var(--grass-6)",
-                    background_color="var(--gray-2)",
-                    align_items="center",
-                    spacing="2"
                 ),
 
                 # Botón oculto auxiliar para forzar recarga manual si fuese necesario
