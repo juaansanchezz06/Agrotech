@@ -1,22 +1,26 @@
 import reflex as rx
 import sqlite3
 import os
-from .login import BaseState, hashear_contrasena
+
+try:
+    from login import BaseState, hashear_contrasena
+except ImportError:
+    from .login import BaseState, hashear_contrasena
 
 DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
 RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
 
+
 class GestorUsuariosState(BaseState):
     usuarios_registrados: list[list[str]] = []
-    
+
     input_usuario: str = ""
     input_contrasena: str = ""
     input_rol: str = "usuario"
-    
+
     error_mensaje: str = ""
     exito_mensaje: str = ""
 
-    # Setters explícitos recuperados para evitar el AttributeError
     def set_input_usuario(self, valor: str):
         self.input_usuario = valor
 
@@ -36,18 +40,18 @@ class GestorUsuariosState(BaseState):
     def comprobar_acceso_admin(self):
         if self.usuario_actual == "":
             return rx.redirect("/")
-            
+
         try:
             with sqlite3.connect(RUTA_DB) as conexion:
                 cursor = conexion.cursor()
                 cursor.execute("SELECT role FROM users WHERE username = ?", (self.usuario_actual,))
                 resultado = cursor.fetchone()
-                
+
                 if not resultado or resultado[0] != "administrador":
                     return rx.redirect("/panel")
         except sqlite3.Error:
             return rx.redirect("/panel")
-            
+
         self.cargar_usuarios()
 
     def cargar_usuarios(self):
@@ -62,11 +66,11 @@ class GestorUsuariosState(BaseState):
     def anadir_usuario(self):
         self.error_mensaje = ""
         self.exito_mensaje = ""
-        
+
         if not self.input_usuario or not self.input_contrasena:
             self.error_mensaje = "Rellena el nombre y la contraseña."
             return
-            
+
         try:
             with sqlite3.connect(RUTA_DB) as conexion:
                 cursor = conexion.cursor()
@@ -74,7 +78,7 @@ class GestorUsuariosState(BaseState):
                 if cursor.fetchone():
                     self.error_mensaje = "El usuario ya existe."
                     return
-                
+
                 pass_hash = hashear_contrasena(self.input_contrasena)
                 cursor.execute(
                     "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
@@ -90,11 +94,11 @@ class GestorUsuariosState(BaseState):
     def cambiar_contrasena(self):
         self.error_mensaje = ""
         self.exito_mensaje = ""
-        
+
         if not self.input_usuario or not self.input_contrasena:
             self.error_mensaje = "Introduce el usuario y la nueva contraseña."
             return
-            
+
         try:
             with sqlite3.connect(RUTA_DB) as conexion:
                 cursor = conexion.cursor()
@@ -102,7 +106,7 @@ class GestorUsuariosState(BaseState):
                 if not cursor.fetchone():
                     self.error_mensaje = "El usuario no existe."
                     return
-                
+
                 pass_hash = hashear_contrasena(self.input_contrasena)
                 cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (pass_hash, self.input_usuario))
                 conexion.commit()
@@ -114,19 +118,19 @@ class GestorUsuariosState(BaseState):
     def borrar_usuario(self):
         self.error_mensaje = ""
         self.exito_mensaje = ""
-        
+
         if not self.input_usuario:
             self.error_mensaje = "Introduce el nombre del usuario a borrar."
             return
-            
+
         if self.input_usuario == "admin":
             self.error_mensaje = "Por seguridad, no se puede borrar al superadministrador."
             return
-            
+
         if self.input_usuario == self.usuario_actual:
             self.error_mensaje = "No puedes borrar tu propia cuenta mientras estás conectado."
             return
-            
+
         try:
             with sqlite3.connect(RUTA_DB) as conexion:
                 cursor = conexion.cursor()
@@ -134,7 +138,7 @@ class GestorUsuariosState(BaseState):
                 if not cursor.fetchone():
                     self.error_mensaje = "El usuario no existe."
                     return
-                
+
                 cursor.execute("DELETE FROM users WHERE username = ?", (self.input_usuario,))
                 conexion.commit()
                 self.exito_mensaje = f"Usuario '{self.input_usuario}' eliminado."
@@ -143,17 +147,31 @@ class GestorUsuariosState(BaseState):
         except sqlite3.Error as e:
             self.error_mensaje = f"Error al borrar: {e}"
 
+
 def fila_usuario(fila: list[str]) -> rx.Component:
+    nombre_rol = rx.match(
+        fila[1],
+        ("administrador", "Administrador"),
+        ("tecnico_agricola", "Técnico Agrícola"),
+        "Usuario"
+    )
+    color_rol = rx.match(
+        fila[1],
+        ("administrador", "crimson"),
+        ("tecnico_agricola", "blue"),
+        "grass"
+    )
     return rx.table.row(
         rx.table.cell(rx.text(fila[0], weight="bold", color="var(--gray-12)")),
         rx.table.cell(
             rx.badge(
-                fila[1].capitalize(), 
-                color_scheme=rx.cond(fila[1] == "administrador", "crimson", "grass"), 
+                nombre_rol,
+                color_scheme=color_rol,
                 variant="soft"
             )
         )
     )
+
 
 def panel_gestor_usuarios() -> rx.Component:
     return rx.box(
@@ -179,7 +197,7 @@ def panel_gestor_usuarios() -> rx.Component:
                 }
             </style>
         """),
-        
+
         rx.hstack(
             rx.hstack(
                 rx.icon(tag="shield-alert", color="crimson", size=30),
@@ -206,7 +224,7 @@ def panel_gestor_usuarios() -> rx.Component:
             border_bottom="1px solid var(--gray-5)",
             background_color="var(--gray-2)"
         ),
-        
+
         rx.hstack(
             rx.vstack(
                 rx.heading("Usuarios Registrados", size="5", color="var(--gray-12)"),
@@ -227,15 +245,15 @@ def panel_gestor_usuarios() -> rx.Component:
                 align_items="stretch",
                 spacing="4"
             ),
-            
+
             rx.vstack(
                 rx.heading("Acciones Administrativas", size="5", color="var(--gray-12)"),
-                
+
                 rx.cond(GestorUsuariosState.error_mensaje != "",
                     rx.callout.root(rx.callout.icon("alert-triangle"), rx.callout.text(GestorUsuariosState.error_mensaje), color_scheme="red", width="100%")),
                 rx.cond(GestorUsuariosState.exito_mensaje != "",
                     rx.callout.root(rx.callout.icon("check-circle"), rx.callout.text(GestorUsuariosState.exito_mensaje), color_scheme="grass", width="100%")),
-                
+
                 rx.tabs.root(
                     rx.tabs.list(
                         rx.tabs.trigger("Añadir", value="add"),
@@ -243,19 +261,19 @@ def panel_gestor_usuarios() -> rx.Component:
                         rx.tabs.trigger("Borrar", value="del"),
                         width="100%"
                     ),
-                    
+
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(
                                 rx.input(placeholder="Nombre de usuario", value=GestorUsuariosState.input_usuario, on_change=GestorUsuariosState.set_input_usuario, width="100%", variant="surface"),
                                 rx.input(type="password", placeholder="Contraseña", value=GestorUsuariosState.input_contrasena, on_change=GestorUsuariosState.set_input_contrasena, width="100%", variant="surface"),
-                                rx.select(["usuario", "administrador"], value=GestorUsuariosState.input_rol, on_change=GestorUsuariosState.set_input_rol, width="100%", variant="surface"),
+                                rx.select(["usuario", "tecnico_agricola", "administrador"], value=GestorUsuariosState.input_rol, on_change=GestorUsuariosState.set_input_rol, width="100%", variant="surface"),
                                 rx.button("Añadir Usuario", on_click=GestorUsuariosState.anadir_usuario, color_scheme="grass", width="100%")
                             ),
                             background_color="var(--gray-2)", border="1px solid var(--gray-5)"
                         ), value="add"
                     ),
-                    
+
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(
@@ -267,7 +285,7 @@ def panel_gestor_usuarios() -> rx.Component:
                             background_color="var(--gray-2)", border="1px solid var(--gray-5)"
                         ), value="pass"
                     ),
-                    
+
                     rx.tabs.content(
                         rx.card(
                             rx.vstack(
