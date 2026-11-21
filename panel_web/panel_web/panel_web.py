@@ -1,414 +1,417 @@
-"""
-MÓDULO PRINCIPAL DE LA APLICACIÓN AGROTECH (panel_web.py)
----------------------------------------------------------
-Este fichero centraliza el panel de monitorización en tiempo real, la visualización
-histórica mediante gráficas, las tablas de catálogo y el enrutamiento general.
-
-ÍNDICE DE SECCIONES:
-  1. Importaciones y configuración global (rutas de BD y diccionarios de mapeo).
-  2. Estado principal (EstadoAgrotech): lógica de negocio, SQLite y WebSockets.
-  3. Componentes de métricas en tiempo real (tarjetas circulares por parcela).
-  4. Componente de gráfica histórica (filtros por fecha, zoom y Recharts).
-  5. Componentes de tablas reutilizables (parcelas, sensores y lecturas).
-  6. Interfaz principal (index): estilos CSS, barra de navegación y pestañas.
-  7. Configuración de la aplicación y registro de rutas.
-"""
+import asyncio
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Any
 
 import reflex as rx
-import sqlite3
-import os
-import json
-import asyncio
 import websockets
-from datetime import datetime, timedelta
-from typing import Any, List, Dict
 
-# Importación de vistas y estados secundarios.
-# El bloque try/except permite ejecutar tanto desde la raíz del proyecto como en modo paquete.
 try:
-    from login import login_page, BaseState
-    from gestor_usuarios import panel_gestor_usuarios, GestorUsuariosState
-    from gestor_parcelas import panel_gestor_parcelas, GestorParcelasState
+    from login import BaseState, login_page, asegurar_bd_agrotech
+    from gestor_usuarios import GestorUsuariosState, panel_gestor_usuarios
+    from gestor_parcelas import GestorParcelasState, panel_gestor_parcelas
 except ImportError:
-    from .login import login_page, BaseState
-    from .gestor_usuarios import panel_gestor_usuarios, GestorUsuariosState
-    from .gestor_parcelas import panel_gestor_parcelas, GestorParcelasState
+    from .login import BaseState, login_page, asegurar_bd_agrotech
+    from .gestor_usuarios import GestorUsuariosState, panel_gestor_usuarios
+    from .gestor_parcelas import GestorParcelasState, panel_gestor_parcelas
 
 
-# ==============================================================================
-# 1. CONFIGURACIÓN GLOBAL Y CONSTANTES DE MAPEO
-# ==============================================================================
-
-# Ruta absoluta hacia la base de datos SQLite situada dos niveles por encima
 DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
-RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
+RUTA_RAIZ = os.path.abspath(os.path.join(DIR_ACTUAL, "..", ".."))
+RUTA_DB = os.path.join(RUTA_RAIZ, "agrotech.db")
 
-# Relaciona el nombre legible de cada parcela con su ID numérico en la base de datos
-MAPA_PARCELAS = {
-    "Parcela Norte": 1,
-    "Parcela Sur": 2,
-    "Invernadero Principal": 3,
-    "Viñedo Este": 4,
-    "Huerto Central": 5
+PARCELAS_DEFECTO: list[list[str]] = [
+    ["1", "Parcela Norte", "Sector A"],
+    ["2", "Parcela Sur", "Sector B"],
+    ["3", "Invernadero Principal", "Sector C"],
+    ["4", "Viñedo Este", "Sector D"],
+    ["5", "Huerto Central", "Sector E"],
+]
+
+MAPA_PARCELAS_DEFECTO: dict[str, int] = {
+    fila[1]: int(fila[0]) for fila in PARCELAS_DEFECTO
 }
 
-# Traduce el nombre técnico de la métrica al sufijo usado en sensor_id (ej. "p1_temp_amb")
-MAPA_TIPOS = {
+MAPA_TIPOS: dict[str, str] = {
     "temperaturaAmb": "temp_amb",
     "humedadSuelo": "humedad",
     "luminosidad": "lux",
     "temperaturaSuelo": "temp_suelo",
-    "ph": "ph"
+    "ph": "ph",
 }
 
+ETIQUETAS_SENSORES: dict[str, tuple[str, str, str]] = {
+    "humedad": ("humedadSuelo", "%", "Sensor Humedad Suelo"),
+    "lux": ("luminosidad", "lux", "Sensor Luz Solar"),
+    "ph": ("ph", "pH", "Sensor pH Suelo"),
+    "temp_amb": ("temperaturaAmb", "ºC", "Sensor Temp. Ambiente"),
+    "temp_suelo": ("temperaturaSuelo", "ºC", "Sensor Temp. Suelo"),
+}
 
-# ==============================================================================
-# 2. ESTADO DEL PANEL Y OBTENCIÓN DINÁMICA DE DATOS
-# ==============================================================================
+ESTILOS_TEMA = """
+<style>
+    :root, .light, .light-theme {
+        color-scheme: light;
+        --gray-1: #F4F7F8 !important;
+        --gray-2: #EBF0F2 !important;
+        --gray-3: #E1E8EC !important;
+        --gray-4: #D3DEE3 !important;
+        --gray-5: #C5D4DC !important;
+        --gray-11: #4A636E !important;
+        --gray-12: #1A2E35 !important;
+    }
+    .dark, .dark-theme, [data-theme="dark"] {
+        color-scheme: dark;
+        --gray-1: #0D2F3A !important;
+        --gray-2: #09242E !important;
+        --gray-3: #123C4A !important;
+        --gray-4: #174859 !important;
+        --gray-5: #1D566B !important;
+        --gray-6: #2A718B !important;
+        --gray-11: #B8D4DF !important;
+        --gray-12: #F0F8FA !important;
+    }
+</style>
+"""
+
+
+def _conectar_db() -> sqlite3.Connection:
+    return sqlite3.connect(RUTA_DB, timeout=15.0)
+
+
+def _color_temperatura(sensor_id: str, valor: float) -> str:
+    if "temp" not in sensor_id:
+        return "var(--gray-12)"
+    if valor > 30:
+        return "#ff8da1"
+    if valor < 20:
+        return "#82b1ff"
+    return "#66cdaa"
+
+
+def _script_ajuste_zoom(reset_scroll: bool) -> str:
+    if reset_scroll:
+        return """
+            const el = document.getElementById('scroll-grafica');
+            if (el) { el.scrollLeft = 0; }
+            window.dispatchEvent(new Event('resize'));
+            requestAnimationFrame(() => {
+                const el2 = document.getElementById('scroll-grafica');
+                if (el2) { el2.scrollLeft = 0; }
+            });
+        """
+    return """
+        const el = document.getElementById('scroll-grafica');
+        if (el) {
+            const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth);
+            if (el.scrollLeft > maxScroll) { el.scrollLeft = maxScroll; }
+        }
+        window.dispatchEvent(new Event('resize'));
+    """
+
+
+def _construir_catalogo_sensores(
+    cursor: sqlite3.Cursor,
+    nombres_parcelas: dict[int, str],
+) -> list[list[str]]:
+    resultado: list[list[str]] = []
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sensors'")
+    if cursor.fetchone() is not None:
+        cursor.execute("PRAGMA table_info(sensors)")
+        columnas = {fila[1] for fila in cursor.fetchall()}
+        col_id = "sensor_id" if "sensor_id" in columnas and "id" not in columnas else "id"
+        cursor.execute(f"SELECT {col_id}, parcel_id, type, unit FROM sensors ORDER BY parcel_id ASC, {col_id} ASC")
+        for sid, pid, tipo, unidad in cursor.fetchall():
+            sid_str = str(sid)
+            sufijo = sid_str.split("_", 1)[1] if "_" in sid_str else ""
+            meta = ETIQUETAS_SENSORES.get(sufijo)
+            desc_base = meta[2] if meta else f"Sensor {tipo}"
+            nombre_p = nombres_parcelas.get(int(pid), f"Parcela #{pid}") if pid is not None else ""
+            descripcion = f"{desc_base} ({nombre_p})" if nombre_p else desc_base
+            resultado.append([sid_str, str(tipo), str(unidad), descripcion])
+
+    if not resultado:
+        for pid, nombre_p in sorted(nombres_parcelas.items()):
+            for sufijo, (tipo, unidad, desc_base) in ETIQUETAS_SENSORES.items():
+                resultado.append([f"p{pid}_{sufijo}", tipo, unidad, f"{desc_base} ({nombre_p})"])
+
+    return resultado
+
 
 class EstadoAgrotech(BaseState):
-    """
-    Gestiona el estado reactivo del panel principal:
-      - Control de sesión y rol del usuario conectado.
-      - Conexión WebSocket en segundo plano para actualizaciones en vivo.
-      - Consultas a SQLite para tarjetas, tablas y gráfica histórica.
-    """
+    _token_streaming: int = 0
+    _firma_grafica: str = ""
 
-    # Control interno para evitar múltiples conexiones WebSocket simultáneas
-    _id_streaming_actual: int = 0
-
-    # Listas que alimentan las tablas del catálogo y el historial reciente
     parcelas: list[list[str]] = []
     sensores: list[list[str]] = []
     lecturas: list[list[str]] = []
 
-    # Datos de sesión y selección activa en la pestaña "Lecturas en Vivo"
+    mapa_parcelas: dict[str, int] = dict(MAPA_PARCELAS_DEFECTO)
+    opciones_parcelas: list[str] = list(MAPA_PARCELAS_DEFECTO.keys())
+
     rol_usuario: str = ""
     parcela_seleccionada: str = "Parcela Norte"
 
-    # Valores formateados para los indicadores circulares de microclima
     temp_amb: str = "-- ºC"
     temp_suelo: str = "-- ºC"
     lux: str = "-- Lux"
     ph: str = "-- pH"
     humedad: str = "-- %"
 
-    # Variables de estado para la pestaña "Evolución (Gráfica)"
-    datos_grafica: List[Dict[str, Any]] = []
+    datos_grafica: list[dict[str, Any]] = []
     grafica_parcela: str = "Parcela Norte"
     grafica_tipo: str = "temperaturaAmb"
     grafica_fecha_inicio: str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     grafica_fecha_fin: str = datetime.now().strftime("%Y-%m-%d")
-    valor_medio: str = "0.0"  # Se guarda como str porque ReferenceLine.y de Recharts exige str | int
-    zoom_grafica: int = 100   # Nivel de ampliación en porcentaje (100% = sin scroll horizontal)
-
-    # Opciones disponibles en los desplegables de filtrado de la gráfica
-    opciones_parcelas: list[str] = [
-        "Parcela Norte",
-        "Parcela Sur",
-        "Invernadero Principal",
-        "Viñedo Este",
-        "Huerto Central"
-    ]
-    opciones_tipos: list[str] = [
-        "temperaturaAmb",
-        "humedadSuelo",
-        "luminosidad",
-        "temperaturaSuelo",
-        "ph"
-    ]
+    valor_medio: str = "0.0"
+    zoom_grafica: int = 100
+    opciones_tipos: list[str] = list(MAPA_TIPOS.keys())
 
     @rx.var
     def ancho_grafica(self) -> str:
-        """Devuelve el ancho CSS de la gráfica según el nivel de zoom activo."""
         return f"{self.zoom_grafica}%"
 
+    @rx.var
+    def puede_gestionar_parcelas(self) -> bool:
+        return self.rol_usuario in ("administrador", "tecnico_agricola")
+
     def aumentar_zoom_grafica(self):
-        """Amplía la anchura de la gráfica un 50% (hasta un máximo de 400%)."""
         if self.zoom_grafica < 400:
             self.zoom_grafica += 50
             return rx.call_script("window.dispatchEvent(new Event('resize'));")
 
     def reducir_zoom_grafica(self):
-        """
-        Reduce la anchura de la gráfica un 50% (hasta el 100% base) y reajusta
-        el desplazamiento horizontal para que nunca quede bloqueado a la derecha.
-        """
         if self.zoom_grafica > 100:
             self.zoom_grafica -= 50
-            if self.zoom_grafica <= 100:
-                return rx.call_script("""
-                    const el = document.getElementById('scroll-grafica');
-                    if (el) { el.scrollLeft = 0; }
-                    window.dispatchEvent(new Event('resize'));
-                    requestAnimationFrame(() => {
-                        const el2 = document.getElementById('scroll-grafica');
-                        if (el2) { el2.scrollLeft = 0; }
-                    });
-                """)
-            return rx.call_script("""
-                const el = document.getElementById('scroll-grafica');
-                if (el) {
-                    const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth);
-                    if (el.scrollLeft > maxScroll) { el.scrollLeft = maxScroll; }
-                }
-                window.dispatchEvent(new Event('resize'));
-            """)
+            return rx.call_script(_script_ajuste_zoom(self.zoom_grafica <= 100))
 
     def comprobar_acceso(self):
-        """
-        Se ejecuta al cargar /panel (on_load).
-        Verifica que haya un usuario autenticado, consulta su rol en SQLite,
-        carga los datos iniciales y arranca el flujo en tiempo real.
-        """
         if self.usuario_actual == "":
             return rx.redirect("/")
-        else:
-            try:
-                with sqlite3.connect(RUTA_DB) as conexion:
-                    cursor = conexion.cursor()
-                    cursor.execute("SELECT role FROM users WHERE username = ?", (self.usuario_actual,))
-                    resultado = cursor.fetchone()
-                    if resultado:
-                        self.rol_usuario = resultado[0]
-                    else:
-                        self.rol_usuario = "usuario"
-            except sqlite3.Error:
-                self.rol_usuario = "usuario"
 
-            self.obtener_datos()
-            return EstadoAgrotech.iniciar_streaming
+        try:
+            asegurar_bd_agrotech()
+            with _conectar_db() as conexion:
+                cursor = conexion.cursor()
+                cursor.execute("SELECT role FROM users WHERE username = ?", (self.usuario_actual,))
+                resultado = cursor.fetchone()
+                self.rol_usuario = resultado[0] if resultado else "usuario"
+        except sqlite3.Error:
+            self.rol_usuario = "usuario"
+
+        self.obtener_datos()
+        return EstadoAgrotech.iniciar_streaming
 
     def set_parcela_seleccionada(self, valor: str):
-        """Cambia la parcela activa, refresca sus métricas y reconecta el WebSocket."""
         self.parcela_seleccionada = valor
         self.obtener_datos()
         return EstadoAgrotech.iniciar_streaming
 
-    # --- Setters de los filtros de la gráfica ---
     def set_grafica_parcela(self, valor: str):
         self.grafica_parcela = valor
+        self._firma_grafica = ""
         self.actualizar_grafica()
 
     def set_grafica_tipo(self, valor: str):
         self.grafica_tipo = valor
+        self._firma_grafica = ""
         self.actualizar_grafica()
 
     def set_grafica_fecha_inicio(self, valor: str):
-        """Actualiza la fecha inicial impidiendo que sea posterior a la fecha final."""
         if valor and self.grafica_fecha_fin and valor > self.grafica_fecha_fin:
             self.grafica_fecha_inicio = self.grafica_fecha_fin
         else:
             self.grafica_fecha_inicio = valor
+        self._firma_grafica = ""
         self.actualizar_grafica()
 
     def set_grafica_fecha_fin(self, valor: str):
-        """Actualiza la fecha final impidiendo que sea anterior a la fecha inicial."""
         if valor and self.grafica_fecha_inicio and valor < self.grafica_fecha_inicio:
             self.grafica_fecha_fin = self.grafica_fecha_inicio
         else:
             self.grafica_fecha_fin = valor
+        self._firma_grafica = ""
         self.actualizar_grafica()
 
-    def actualizar_grafica(self):
+    def _cargar_grafica_con_cursor(self, cursor: sqlite3.Cursor):
+        p_id = self.mapa_parcelas.get(self.grafica_parcela, 1)
+        s_suffix = MAPA_TIPOS.get(self.grafica_tipo, "temp_amb")
+        target_sensor_id = f"p{p_id}_{s_suffix}"
+
+        condiciones = ["sensor_id = ?"]
+        parametros: list[Any] = [target_sensor_id]
+
+        if self.grafica_fecha_inicio:
+            condiciones.append("substr(timestamp, 1, 10) >= ?")
+            parametros.append(self.grafica_fecha_inicio)
+
+        if self.grafica_fecha_fin:
+            condiciones.append("substr(timestamp, 1, 10) <= ?")
+            parametros.append(self.grafica_fecha_fin)
+
+        query = f"""
+            SELECT timestamp, value
+            FROM sensor_data
+            WHERE {' AND '.join(condiciones)}
+            ORDER BY id ASC
         """
-        Consulta en SQLite las lecturas del sensor seleccionado dentro del rango
-        de fechas elegido por el usuario, las ordena cronológicamente y calcula
-        el valor medio para la línea de referencia.
-        """
-        try:
-            with sqlite3.connect(RUTA_DB) as conexion:
-                cursor = conexion.cursor()
+        cursor.execute(query, tuple(parametros))
+        datos_raw = cursor.fetchall()
 
-                # Construye el identificador real del sensor (ej. "p2_humedad")
-                p_id = MAPA_PARCELAS.get(self.grafica_parcela, 1)
-                s_suffix = MAPA_TIPOS.get(self.grafica_tipo, "temp_amb")
-                target_sensor_id = f"p{p_id}_{s_suffix}"
+        ultimo_registro = datos_raw[-1] if datos_raw else ("", 0)
+        nueva_firma = f"{target_sensor_id}|{len(datos_raw)}|{ultimo_registro[0]}|{ultimo_registro[1]}"
+        if nueva_firma == self._firma_grafica:
+            return
+        self._firma_grafica = nueva_firma
 
-                # Construye la consulta filtrando por rango de fechas (YYYY-MM-DD)
-                condiciones = ["sensor_id = ?"]
-                parametros: list[Any] = [target_sensor_id]
+        mismo_dia = bool(self.grafica_fecha_inicio) and self.grafica_fecha_inicio == self.grafica_fecha_fin
+        grafica_formateada: list[dict[str, Any]] = []
+        etiquetas_vistas: dict[str, int] = {}
+        suma = 0.0
 
-                if self.grafica_fecha_inicio:
-                    condiciones.append("substr(timestamp, 1, 10) >= ?")
-                    parametros.append(self.grafica_fecha_inicio)
-
-                if self.grafica_fecha_fin:
-                    condiciones.append("substr(timestamp, 1, 10) <= ?")
-                    parametros.append(self.grafica_fecha_fin)
-
-                query = f"""
-                    SELECT timestamp, value
-                    FROM sensor_data
-                    WHERE {' AND '.join(condiciones)}
-                    ORDER BY id ASC
-                """
-                cursor.execute(query, tuple(parametros))
-                datos_raw = cursor.fetchall()
-
-                grafica_formateada = []
-                suma = 0.0
-                mismo_dia = (
-                    bool(self.grafica_fecha_inicio)
-                    and self.grafica_fecha_inicio == self.grafica_fecha_fin
+        for timestamp_raw, valor_raw in datos_raw:
+            fecha_str = str(timestamp_raw) if timestamp_raw else ""
+            if len(fecha_str) >= 19:
+                etiqueta_base = (
+                    fecha_str[11:19]
+                    if mismo_dia
+                    else f"{fecha_str[8:10]}/{fecha_str[5:7]} {fecha_str[11:19]}"
                 )
+            else:
+                etiqueta_base = fecha_str
 
-                for fila in datos_raw:
-                    fecha_cruda_g = str(fila[0]) if fila[0] else ""
-                    if len(fecha_cruda_g) >= 19:
-                        if mismo_dia:
-                            # Si es un solo día, mostramos HH:MM:SS
-                            etiqueta_tiempo = fecha_cruda_g[11:19]
-                        else:
-                            # Si abarca varios días, mostramos DD/MM HH:MM
-                            etiqueta_tiempo = f"{fecha_cruda_g[8:10]}/{fecha_cruda_g[5:7]} {fecha_cruda_g[11:16]}"
-                    else:
-                        etiqueta_tiempo = fecha_cruda_g
+            repeticiones = etiquetas_vistas.get(etiqueta_base, 0) + 1
+            etiquetas_vistas[etiqueta_base] = repeticiones
+            etiqueta = etiqueta_base if repeticiones == 1 else f"{etiqueta_base} ({repeticiones})"
 
-                    valor_g = float(fila[1]) if fila[1] is not None else 0.0
+            valor = float(valor_raw) if valor_raw is not None else 0.0
+            suma += valor
+            grafica_formateada.append({"hora": etiqueta, "Valor": valor})
 
-                    suma += valor_g
-                    grafica_formateada.append({
-                        "hora": etiqueta_tiempo,
-                        "Valor": valor_g
-                    })
+        self.datos_grafica = grafica_formateada
+        self.valor_medio = str(round(suma / len(datos_raw), 2) if datos_raw else 0.0)
 
-                self.datos_grafica = grafica_formateada
-
-                # Calcula la media redondeada a 2 decimales y la convierte a texto
-                media_calculada = round(suma / len(datos_raw), 2) if len(datos_raw) > 0 else 0.0
-                self.valor_medio = str(media_calculada)
-
+    def actualizar_grafica(self):
+        try:
+            with _conectar_db() as conexion:
+                self._cargar_grafica_con_cursor(conexion.cursor())
         except sqlite3.Error as e:
             print(f"Error al actualizar gráfica: {e}")
             self.datos_grafica = []
             self.valor_medio = "0.0"
 
-    @rx.event(background=True)
-    async def iniciar_streaming(self):
-        """
-        Tarea asíncrona en segundo plano que escucha el servidor WebSocket (puerto 8001)
-        para la parcela activa. Cada vez que llega un paquete nuevo, refresca la interfaz.
-        """
-        async with self:
-            id_parcela = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
-            if self._id_streaming_actual == id_parcela:
-                return
-            self._id_streaming_actual = id_parcela
-
-        uri = f"ws://localhost:8001/ws/parcels/{id_parcela}"
-
-        try:
-            async with websockets.connect(uri) as websocket:
-                while True:
-                    async with self:
-                        if self._id_streaming_actual != id_parcela:
-                            break
-
-                    mensaje = await websocket.recv()
-
-                    async with self:
-                        self.obtener_datos()
-
-        except Exception as e:
-            print(f"Streaming desconectado de parcela {id_parcela}: {e}")
-            async with self:
-                self._id_streaming_actual = 0
-
     def obtener_datos(self):
-        """
-        Sincroniza el estado con la base de datos:
-          1. Carga el listado de parcelas registradas.
-          2. Define el catálogo de tipos de sensores.
-          3. Obtiene las últimas 15 lecturas globales con código de color térmico.
-          4. Carga la última lectura de cada sensor de la parcela seleccionada.
-          5. Refresca también los datos de la gráfica.
-        """
         try:
-            with sqlite3.connect(RUTA_DB) as conexion:
+            asegurar_bd_agrotech()
+            with _conectar_db() as conexion:
                 cursor = conexion.cursor()
 
-                # 1. Listado de parcelas (con respaldo estático si la tabla está vacía)
                 cursor.execute("SELECT id, name, location FROM parcels ORDER BY id ASC")
                 filas_parcelas = cursor.fetchall()
+
                 if filas_parcelas:
-                    self.parcelas = [[str(col) if col is not None else "" for col in row] for row in filas_parcelas]
-                else:
                     self.parcelas = [
-                        ["1", "Parcela Norte", "Sector A"],
-                        ["2", "Parcela Sur", "Sector B"],
-                        ["3", "Invernadero Principal", "Sector C"],
-                        ["4", "Viñedo Este", "Sector D"],
-                        ["5", "Huerto Central", "Sector E"]
+                        [str(col) if col is not None else "" for col in row]
+                        for row in filas_parcelas
                     ]
+                    nuevo_mapa = {str(row[1]): int(row[0]) for row in filas_parcelas if row[1]}
+                    nombres_por_id = {int(row[0]): str(row[1]) for row in filas_parcelas if row[1]}
+                    self.mapa_parcelas = nuevo_mapa
+                    self.opciones_parcelas = list(nuevo_mapa.keys())
+                else:
+                    self.parcelas = [list(fila) for fila in PARCELAS_DEFECTO]
+                    self.mapa_parcelas = dict(MAPA_PARCELAS_DEFECTO)
+                    self.opciones_parcelas = list(MAPA_PARCELAS_DEFECTO.keys())
+                    nombres_por_id = {int(f[0]): f[1] for f in PARCELAS_DEFECTO}
 
-                # 2. Catálogo descriptivo de sensores por parcela
-                self.sensores = [
-                    ["p#_humedad", "humedadSuelo", "%", "Sensor Humedad Suelo"],
-                    ["p#_lux", "luminosidad", "lux", "Sensor Luz Solar"],
-                    ["p#_ph", "ph", "pH", "Sensor pH Suelo"],
-                    ["p#_temp_amb", "temperaturaAmb", "ºC", "Sensor Temp. Ambiente"],
-                    ["p#_temp_suelo", "temperaturaSuelo", "ºC", "Sensor Temp. Suelo"]
-                ]
+                if self.opciones_parcelas:
+                    if self.parcela_seleccionada not in self.mapa_parcelas:
+                        self.parcela_seleccionada = self.opciones_parcelas[0]
+                    if self.grafica_parcela not in self.mapa_parcelas:
+                        self.grafica_parcela = self.opciones_parcelas[0]
 
-                # 3. Últimas 15 lecturas recibidas para la tabla inferior
+                self.sensores = _construir_catalogo_sensores(cursor, nombres_por_id)
+
                 cursor.execute("""
                     SELECT sensor_id, timestamp, value
                     FROM sensor_data
-                    ORDER BY id DESC LIMIT 15
+                    ORDER BY id DESC
+                    LIMIT 15
                 """)
-                datos_brutos = cursor.fetchall()
-                datos_formateados = []
+                lecturas_formateadas: list[list[str]] = []
+                for sensor_raw, fecha_raw, valor_raw in cursor.fetchall():
+                    sensor = str(sensor_raw) if sensor_raw else "Desconocido"
+                    fecha_str = str(fecha_raw) if fecha_raw else ""
+                    fecha_limpia = fecha_str[:19].replace("T", " ") if len(fecha_str) >= 19 else fecha_str
+                    valor = float(valor_raw) if valor_raw is not None else 0.0
+                    lecturas_formateadas.append([
+                        sensor,
+                        fecha_limpia,
+                        str(valor),
+                        _color_temperatura(sensor, valor),
+                    ])
+                self.lecturas = lecturas_formateadas
 
-                for fila in datos_brutos:
-                    sensor = str(fila[0]) if fila[0] else "Desconocido"
-                    fecha_cruda = str(fila[1]) if fila[1] else ""
-                    fecha_limpia = fecha_cruda[:19].replace('T', ' ') if len(fecha_cruda) >= 19 else fecha_cruda
-                    valor_real = float(fila[2]) if fila[2] is not None else 0.0
-
-                    # Código de color para alertas visuales de temperatura (>30ºC cálido, <20ºC frío)
-                    color_texto = "var(--gray-12)"
-                    if "temp" in sensor:
-                        if valor_real > 30:
-                            color_texto = "#ff8da1"
-                        elif valor_real < 20:
-                            color_texto = "#82b1ff"
-                        else:
-                            color_texto = "#66cdaa"
-
-                    datos_formateados.append([sensor, fecha_limpia, str(valor_real), color_texto])
-
-                self.lecturas = datos_formateados
-
-                # 4. Último valor registrado por cada sensor de la parcela seleccionada
-                p_id = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
+                p_id = self.mapa_parcelas.get(self.parcela_seleccionada, 1)
+                patron_parcela = f"p{p_id}_%"
                 cursor.execute("""
-                    SELECT sensor_id, value FROM sensor_data
-                    WHERE sensor_id LIKE ? AND id IN (
-                        SELECT MAX(id) FROM sensor_data GROUP BY sensor_id
+                    SELECT sensor_id, value
+                    FROM sensor_data
+                    WHERE id IN (
+                        SELECT MAX(id)
+                        FROM sensor_data
+                        WHERE sensor_id LIKE ?
+                        GROUP BY sensor_id
                     )
-                """, (f"p{p_id}_%",))
-                ultimos_datos = dict(cursor.fetchall())
+                """, (patron_parcela,))
+                ultimos = dict(cursor.fetchall())
 
-                self.temp_amb = f"{ultimos_datos.get(f'p{p_id}_temp_amb', '--')} ºC"
-                self.temp_suelo = f"{ultimos_datos.get(f'p{p_id}_temp_suelo', '--')} ºC"
-                self.humedad = f"{ultimos_datos.get(f'p{p_id}_humedad', '--')} %"
-                self.lux = f"{ultimos_datos.get(f'p{p_id}_lux', '--')} Lux"
-                self.ph = f"{ultimos_datos.get(f'p{p_id}_ph', '--')} pH"
+                self.temp_amb = f"{ultimos.get(f'p{p_id}_temp_amb', '--')} ºC"
+                self.temp_suelo = f"{ultimos.get(f'p{p_id}_temp_suelo', '--')} ºC"
+                self.humedad = f"{ultimos.get(f'p{p_id}_humedad', '--')} %"
+                self.lux = f"{ultimos.get(f'p{p_id}_lux', '--')} Lux"
+                self.ph = f"{ultimos.get(f'p{p_id}_ph', '--')} pH"
 
-                # 5. Actualización sincronizada de la gráfica
-                self.actualizar_grafica()
+                self._cargar_grafica_con_cursor(cursor)
 
         except sqlite3.Error as e:
             print(f"Error en la base de datos: {e}")
 
+    @rx.event(background=True)
+    async def iniciar_streaming(self):
+        async with self:
+            self._token_streaming += 1
+            mi_token = self._token_streaming
+            id_parcela = self.mapa_parcelas.get(self.parcela_seleccionada, 1)
 
-# ==============================================================================
-# 3. COMPONENTES VISUALES DE MÉTRICAS EN VIVO
-# ==============================================================================
+        uri = f"ws://localhost:8001/ws/parcels/{id_parcela}"
+
+        while True:
+            async with self:
+                if self._token_streaming != mi_token or self.usuario_actual == "":
+                    return
+
+            try:
+                async with websockets.connect(uri) as websocket:
+                    while True:
+                        async with self:
+                            if self._token_streaming != mi_token or self.usuario_actual == "":
+                                return
+
+                        await websocket.recv()
+
+                        async with self:
+                            if self._token_streaming != mi_token or self.usuario_actual == "":
+                                return
+                            self.obtener_datos()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                await asyncio.sleep(2.0)
+
 
 def tarjeta_metrica_circular(titulo: str, valor: str, icono: str, color_borde: str) -> rx.Component:
-    """Renderiza un indicador circular individual con icono, valor y borde coloreado."""
     return rx.vstack(
         rx.text(titulo, weight="bold", size="2", color="var(--gray-11)"),
         rx.center(
@@ -417,7 +420,7 @@ def tarjeta_metrica_circular(titulo: str, valor: str, icono: str, color_borde: s
                 rx.text(valor, weight="bold", size="4", color="var(--gray-12)"),
                 align="center",
                 justify="center",
-                spacing="1"
+                spacing="1",
             ),
             width="135px",
             height="135px",
@@ -427,26 +430,24 @@ def tarjeta_metrica_circular(titulo: str, valor: str, icono: str, color_borde: s
             background_color="var(--gray-2)",
         ),
         align="center",
-        spacing="2"
+        spacing="2",
     )
 
 
 def vista_boceto_parcelas() -> rx.Component:
-    """Contenedor superior con el selector de parcela y las 5 tarjetas de microclima."""
     return rx.vstack(
-        # Cabecera con desplegable de selección de parcela
         rx.hstack(
             rx.hstack(
                 rx.heading("PARCELA:", size="3", color="var(--gray-12)", weight="bold"),
                 rx.select(
-                    list(MAPA_PARCELAS.keys()),
+                    EstadoAgrotech.opciones_parcelas,
                     value=EstadoAgrotech.parcela_seleccionada,
                     on_change=EstadoAgrotech.set_parcela_seleccionada,
                     variant="soft",
-                    size="2"
+                    size="2",
                 ),
                 align="center",
-                spacing="3"
+                spacing="3",
             ),
             rx.text("Métricas de Suelo y Microclima", size="2", color="var(--gray-11)"),
             width="100%",
@@ -456,9 +457,8 @@ def vista_boceto_parcelas() -> rx.Component:
             spacing="3",
             padding_bottom="1.2em",
             border_bottom="1px solid var(--gray-5)",
-            margin_bottom="1.5em"
+            margin_bottom="1.5em",
         ),
-        # Fila flexible con los 5 indicadores circulares
         rx.flex(
             tarjeta_metrica_circular("Tª Ambiente", EstadoAgrotech.temp_amb, "thermometer", "#ff8da1"),
             tarjeta_metrica_circular("Tª Suelo", EstadoAgrotech.temp_suelo, "sprout", "#82b1ff"),
@@ -468,7 +468,7 @@ def vista_boceto_parcelas() -> rx.Component:
             wrap="wrap",
             justify="center",
             spacing="5",
-            width="100%"
+            width="100%",
         ),
         width="100%",
         min_width="0",
@@ -478,24 +478,13 @@ def vista_boceto_parcelas() -> rx.Component:
         background_color="var(--gray-2)",
         box_shadow="0 4px 20px rgba(0, 0, 0, 0.03)",
         margin_top="1.5em",
-        margin_bottom="1em"
+        margin_bottom="1em",
     )
 
 
-# ==============================================================================
-# 4. COMPONENTE DE GRÁFICA INTERACTIVA (RECHARTS)
-# ==============================================================================
-
 def vista_grafica() -> rx.Component:
-    """
-    Tarjeta de la pestaña 'Evolución (Gráfica)':
-      - Selectores de Parcela, Métrica y rango de fechas (Desde / Hasta) validado.
-      - Controles de zoom (+ / -) con scroll horizontal adaptativo y auto-centrado al 100%.
-      - Gráfica lineal Recharts con alto contraste en modo claro y oscuro.
-    """
     return rx.card(
         rx.vstack(
-            # Cabecera con título y controles de zoom (+ / -)
             rx.hstack(
                 rx.vstack(
                     rx.heading("Evolución de Métricas", size="4", color="var(--gray-12)"),
@@ -552,7 +541,6 @@ def vista_grafica() -> rx.Component:
                 margin_bottom="1em",
             ),
 
-            # Barra de filtros de la gráfica
             rx.hstack(
                 rx.vstack(
                     rx.text("Parcela", size="1", weight="bold", color="var(--gray-12)"),
@@ -560,9 +548,9 @@ def vista_grafica() -> rx.Component:
                         EstadoAgrotech.opciones_parcelas,
                         value=EstadoAgrotech.grafica_parcela,
                         on_change=EstadoAgrotech.set_grafica_parcela,
-                        variant="soft"
+                        variant="soft",
                     ),
-                    align="start"
+                    align="start",
                 ),
                 rx.vstack(
                     rx.text("Métrica", size="1", weight="bold", color="var(--gray-12)"),
@@ -570,9 +558,9 @@ def vista_grafica() -> rx.Component:
                         EstadoAgrotech.opciones_tipos,
                         value=EstadoAgrotech.grafica_tipo,
                         on_change=EstadoAgrotech.set_grafica_tipo,
-                        variant="soft"
+                        variant="soft",
                     ),
-                    align="start"
+                    align="start",
                 ),
                 rx.vstack(
                     rx.text("Desde", size="1", weight="bold", color="var(--gray-12)"),
@@ -584,7 +572,7 @@ def vista_grafica() -> rx.Component:
                         variant="soft",
                         color_scheme="grass",
                     ),
-                    align="start"
+                    align="start",
                 ),
                 rx.vstack(
                     rx.text("Hasta", size="1", weight="bold", color="var(--gray-12)"),
@@ -596,15 +584,14 @@ def vista_grafica() -> rx.Component:
                         variant="soft",
                         color_scheme="grass",
                     ),
-                    align="start"
+                    align="start",
                 ),
                 wrap="wrap",
                 spacing="5",
                 margin_bottom="1.5em",
-                width="100%"
+                width="100%",
             ),
 
-            # Resumen del valor medio calculado
             rx.hstack(
                 rx.text("Media del periodo:", size="2", color="var(--gray-11)"),
                 rx.text(EstadoAgrotech.valor_medio, size="3", weight="bold", color="var(--grass-11)"),
@@ -613,7 +600,6 @@ def vista_grafica() -> rx.Component:
                 margin_bottom="1.2em",
             ),
 
-            # Contenedor con scroll horizontal adaptativo (sin scroll y reseteado al 100%)
             rx.box(
                 rx.box(
                     rx.recharts.line_chart(
@@ -628,7 +614,6 @@ def vista_grafica() -> rx.Component:
                             dot={"fill": "#64B5F6", "stroke": "var(--gray-12)", "strokeWidth": 1, "r": 4},
                             active_dot={"r": 6, "fill": "var(--grass-9)", "stroke": "var(--gray-12)"},
                         ),
-                        # Línea horizontal discontinua que marca la media
                         rx.recharts.reference_line(
                             y=EstadoAgrotech.valor_medio,
                             stroke="var(--grass-9)",
@@ -684,12 +669,7 @@ def vista_grafica() -> rx.Component:
     )
 
 
-# ==============================================================================
-# 5. COMPONENTES DE TABLAS REUTILIZABLES
-# ==============================================================================
-
 def crear_tabla(cabeceras: list[str], datos: list[list[str]], render_fila) -> rx.Component:
-    """Plantilla genérica de tabla con scroll horizontal y diseño de tarjeta."""
     return rx.card(
         rx.box(
             rx.table.root(
@@ -710,34 +690,28 @@ def crear_tabla(cabeceras: list[str], datos: list[list[str]], render_fila) -> rx
         border="1px solid var(--gray-5)",
         background_color="var(--gray-2)",
         box_shadow="0 4px 12px rgba(0, 0, 0, 0.03)",
-        border_radius="16px"
+        border_radius="16px",
     )
 
 
 def fila_parcela(fila: list[str]) -> rx.Component:
-    """Renderiza una fila de la tabla 'Listado de Parcelas'."""
     return rx.table.row(
         rx.table.row_header_cell(rx.badge(fila[0], color_scheme="green", variant="soft")),
         rx.table.cell(rx.text(fila[1], weight="bold", color="var(--gray-12)")),
-        rx.table.cell(rx.text(fila[2], color="var(--gray-11)"))
+        rx.table.cell(rx.text(fila[2], color="var(--gray-11)")),
     )
 
 
 def fila_sensor(fila: list[str]) -> rx.Component:
-    """Renderiza una fila de la tabla 'Listado de Sensores'."""
     return rx.table.row(
         rx.table.row_header_cell(rx.badge(fila[0], color_scheme="blue", variant="soft")),
         rx.table.cell(rx.text(fila[1], weight="bold", color="var(--gray-12)")),
         rx.table.cell(rx.text(fila[2], color="var(--gray-11)")),
-        rx.table.cell(rx.text(fila[3], color="var(--gray-11)"))
+        rx.table.cell(rx.text(fila[3], color="var(--gray-11)")),
     )
 
 
 def fila_lectura(fila: list[str]) -> rx.Component:
-    """
-    Renderiza una fila de la tabla 'Lecturas en Vivo', añadiendo dinámicamente
-    la unidad de medida según el nombre del sensor.
-    """
     unidad = rx.cond(
         fila[0].contains("temp"),
         " ºC",
@@ -747,67 +721,32 @@ def fila_lectura(fila: list[str]) -> rx.Component:
             rx.cond(
                 fila[0].contains("lux"),
                 " lux",
-                rx.cond(fila[0].contains("ph"), " pH", "")
-            )
-        )
+                rx.cond(fila[0].contains("ph"), " pH", ""),
+            ),
+        ),
     )
 
     return rx.table.row(
         rx.table.row_header_cell(rx.badge(fila[0], color_scheme="blue", variant="soft")),
         rx.table.cell(rx.text(fila[1], size="2", color="var(--gray-11)")),
         rx.table.cell(rx.text(fila[2] + unidad, weight="bold", color=fila[3])),
-        rx.table.cell(rx.badge("Recibido", color_scheme="grass", variant="soft"))
+        rx.table.cell(rx.badge("Recibido", color_scheme="grass", variant="soft")),
     )
 
 
-# ==============================================================================
-# 6. INTERFAZ PRINCIPAL DEL PANEL (/panel)
-# ==============================================================================
-
 def index() -> rx.Component:
-    """Construye la página principal completa: estilos, navbar, cabecera y pestañas."""
     return rx.box(
-        # Sobrescritura de tokens de color de Radix UI para paleta personalizada en modo claro y oscuro
-        rx.html("""
-            <style>
-                :root, .light, .light-theme {
-                    color-scheme: light;
-                    --gray-1: #F4F7F8 !important;
-                    --gray-2: #EBF0F2 !important;
-                    --gray-3: #E1E8EC !important;
-                    --gray-4: #D3DEE3 !important;
-                    --gray-5: #C5D4DC !important;
-                    --gray-11: #4A636E !important;
-                    --gray-12: #1A2E35 !important;
-                }
-                .dark, .dark-theme, [data-theme="dark"] {
-                    color-scheme: dark;
-                    --gray-1: #0D2F3A !important;
-                    --gray-2: #09242E !important;
-                    --gray-3: #123C4A !important;
-                    --gray-4: #174859 !important;
-                    --gray-5: #1D566B !important;
-                    --gray-6: #2A718B !important;
-                    --gray-11: #B8D4DF !important;
-                    --gray-12: #F0F8FA !important;
-                }
-            </style>
-        """),
+        rx.html(ESTILOS_TEMA),
 
-        # --- BARRA DE NAVEGACIÓN SUPERIOR (NAVBAR) ---
         rx.hstack(
-            # Logotipo y título
             rx.hstack(
                 rx.icon(tag="leaf", color="var(--grass-9)", size=30),
                 rx.heading("Catálogo Agrotech", size="5", color="var(--grass-11)", weight="bold"),
                 align_items="center",
-                spacing="3"
+                spacing="3",
             ),
-
-            # Selector de tema y menú desplegable de usuario
             rx.hstack(
                 rx.color_mode.button(),
-
                 rx.menu.root(
                     rx.menu.trigger(
                         rx.hstack(
@@ -815,7 +754,7 @@ def index() -> rx.Component:
                                 fallback=BaseState.usuario_actual[:1].upper(),
                                 size="1",
                                 color_scheme="grass",
-                                variant="solid"
+                                variant="solid",
                             ),
                             rx.vstack(
                                 rx.text(BaseState.usuario_actual, weight="bold", size="2", color="var(--gray-12)"),
@@ -824,13 +763,13 @@ def index() -> rx.Component:
                                         EstadoAgrotech.rol_usuario,
                                         ("administrador", "Administrador"),
                                         ("tecnico_agricola", "Técnico Agrícola"),
-                                        "Usuario"
+                                        "Usuario",
                                     ),
                                     size="1",
-                                    color="var(--grass-10)"
+                                    color="var(--grass-10)",
                                 ),
                                 spacing="0",
-                                align_items="start"
+                                align_items="start",
                             ),
                             padding="0.35em 0.75em",
                             border_radius="12px",
@@ -839,38 +778,37 @@ def index() -> rx.Component:
                             align_items="center",
                             spacing="2",
                             cursor="pointer",
-                            _hover={"background_color": "var(--gray-4)"}
+                            _hover={"background_color": "var(--gray-4)"},
                         )
                     ),
-                    # Opciones del menú condicionadas según el rol del usuario
                     rx.menu.content(
                         rx.cond(
                             EstadoAgrotech.rol_usuario == "administrador",
                             rx.menu.item(
                                 rx.icon("users", size=16),
                                 "Gestión de usuarios",
-                                on_click=rx.redirect("/gestor-usuarios")
-                            )
+                                on_click=rx.redirect("/gestor-usuarios"),
+                            ),
                         ),
                         rx.cond(
-                            (EstadoAgrotech.rol_usuario == "administrador") | (EstadoAgrotech.rol_usuario == "tecnico_agricola"),
+                            EstadoAgrotech.puede_gestionar_parcelas,
                             rx.menu.item(
                                 rx.icon("map-pin", size=16),
                                 "Gestión de parcelas",
-                                on_click=rx.redirect("/gestor-parcelas")
-                            )
+                                on_click=rx.redirect("/gestor-parcelas"),
+                            ),
                         ),
                         rx.cond(
-                            (EstadoAgrotech.rol_usuario == "administrador") | (EstadoAgrotech.rol_usuario == "tecnico_agricola"),
-                            rx.menu.separator()
+                            EstadoAgrotech.puede_gestionar_parcelas,
+                            rx.menu.separator(),
                         ),
                         rx.menu.item(
                             rx.icon("log-out", size=16),
                             "Cerrar Sesión",
                             on_click=BaseState.cerrar_sesion,
-                            color="red"
-                        )
-                    )
+                            color="red",
+                        ),
+                    ),
                 ),
                 spacing="4",
                 align_items="center",
@@ -878,7 +816,7 @@ def index() -> rx.Component:
             justify_content="space-between",
             align_items="center",
             wrap="wrap",
-            gap="3",
+            spacing="3",
             width="100%",
             min_width="0",
             padding=["0.8em 1em", "0.8em 2em"],
@@ -886,34 +824,19 @@ def index() -> rx.Component:
             background_color="var(--gray-2)",
         ),
 
-        # --- CONTENEDOR CENTRAL DEL DASHBOARD ---
         rx.vstack(
-            # Cabecera de sección
-            rx.hstack(
-                rx.vstack(
-                    rx.heading("Monitorización y Catálogo", size="7", weight="bold", color="var(--gray-12)"),
-                    rx.text("Visualiza las parcelas, sensores y los datos en tiempo real.", color="var(--gray-11)", size="2"),
-                    align_items="start",
-                    spacing="1"
+            rx.vstack(
+                rx.heading("Monitorización y Catálogo", size="7", weight="bold", color="var(--gray-12)"),
+                rx.text(
+                    "Visualiza las parcelas, sensores y los datos en tiempo real.",
+                    color="var(--gray-11)",
+                    size="2",
                 ),
-
-                # Botón oculto auxiliar para forzar recarga manual si fuese necesario
-                rx.button(
-                    "Actualizar Datos",
-                    id="btn-actualizar",
-                    on_click=EstadoAgrotech.obtener_datos,
-                    display="none",
-                ),
-
+                align_items="start",
+                spacing="1",
                 width="100%",
-                min_width="0",
-                align_items="center",
-                flex_direction=["column", "row"],
-                spacing="4",
-                margin_bottom="1.5em"
+                margin_bottom="1.5em",
             ),
-
-            # Sistema de pestañas de navegación del panel
             rx.tabs.root(
                 rx.tabs.list(
                     rx.tabs.trigger("Lecturas en Vivo", value="lecturas"),
@@ -928,7 +851,11 @@ def index() -> rx.Component:
                 rx.tabs.content(
                     rx.vstack(
                         vista_boceto_parcelas(),
-                        crear_tabla(["ID Sensor", "Fecha / Hora", "Valor", "Estado"], EstadoAgrotech.lecturas, fila_lectura),
+                        crear_tabla(
+                            ["ID Sensor", "Fecha / Hora", "Valor", "Estado"],
+                            EstadoAgrotech.lecturas,
+                            fila_lectura,
+                        ),
                         spacing="4",
                         width="100%",
                         min_width="0",
@@ -950,7 +877,11 @@ def index() -> rx.Component:
                     min_width="0",
                 ),
                 rx.tabs.content(
-                    crear_tabla(["ID Sensor", "Tipo", "Unidad", "Descripción"], EstadoAgrotech.sensores, fila_sensor),
+                    crear_tabla(
+                        ["ID Sensor", "Tipo", "Unidad", "Descripción"],
+                        EstadoAgrotech.sensores,
+                        fila_sensor,
+                    ),
                     value="sensores",
                     width="100%",
                     min_width="0",
@@ -960,7 +891,6 @@ def index() -> rx.Component:
                 max_width="100%",
                 min_width="0",
             ),
-
             width="100%",
             max_width="1200px",
             min_width="0",
@@ -974,12 +904,18 @@ def index() -> rx.Component:
     )
 
 
-# ==============================================================================
-# 7. CONFIGURACIÓN DE LA APP Y REGISTRO DE RUTAS
-# ==============================================================================
-
 app = rx.App()
 app.add_page(login_page, route="/", title="Login | Agrotech")
 app.add_page(index, route="/panel", on_load=EstadoAgrotech.comprobar_acceso, title="Panel Agrotech")
-app.add_page(panel_gestor_usuarios, route="/gestor-usuarios", on_load=GestorUsuariosState.comprobar_acceso_admin, title="Gestor de Usuarios")
-app.add_page(panel_gestor_parcelas, route="/gestor-parcelas", on_load=GestorParcelasState.comprobar_acceso_parcelas, title="Gestión de Parcelas")
+app.add_page(
+    panel_gestor_usuarios,
+    route="/gestor-usuarios",
+    on_load=GestorUsuariosState.comprobar_acceso_admin,
+    title="Gestor de Usuarios",
+)
+app.add_page(
+    panel_gestor_parcelas,
+    route="/gestor-parcelas",
+    on_load=GestorParcelasState.comprobar_acceso_parcelas,
+    title="Gestión de Parcelas",
+)
