@@ -95,6 +95,19 @@ def asegurar_db_inicial() -> None:
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sensor_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                value REAL NOT NULL,
+                raw TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sensor_data_sensor_ts 
+            ON sensor_data(sensor_id, timestamp)
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parcel_id INTEGER,
