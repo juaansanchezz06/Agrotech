@@ -15,42 +15,36 @@ histórica mediante gráficas, las tablas de catálogo y el enrutamiento general
 """
 
 import reflex as rx
-import sqlite3
-import os
-import json
 import asyncio
-import websockets
 from datetime import datetime, timedelta
 from typing import Any, List, Dict
+from funcs.usuarios import obtener_rol_usuario
+from funcs.parcelas import MAPA_PARCELAS, obtener_parcelas_tabla
+from funcs.sensores import (
+    MAPA_TIPOS,
+    CATALOGO_SENSORES,
+    obtener_ultimas_lecturas_tabla,
+    obtener_metricas_actuales_parcela,
+    obtener_datos_grafica_sensor,
+)
 
-# Importación de vistas y estados secundarios.
-# El bloque try/except permite ejecutar tanto desde la raíz del proyecto como en modo paquete.
 try:
     from login import login_page, BaseState
     from gestor_usuarios import panel_gestor_usuarios, GestorUsuariosState
     from gestor_parcelas import panel_gestor_parcelas, GestorParcelasState
+    from estilos import ESTILOS_TEMA, JS_ZOOM_RESET, JS_ZOOM_AJUSTAR
 except ImportError:
     from .login import login_page, BaseState
     from .gestor_usuarios import panel_gestor_usuarios, GestorUsuariosState
     from .gestor_parcelas import panel_gestor_parcelas, GestorParcelasState
+    from .estilos import ESTILOS_TEMA, JS_ZOOM_RESET, JS_ZOOM_AJUSTAR
 
 
 # ==============================================================================
 # 1. CONFIGURACIÓN GLOBAL Y CONSTANTES DE MAPEO
 # ==============================================================================
 
-# Ruta absoluta hacia la base de datos SQLite situada dos niveles por encima
-DIR_ACTUAL = os.path.dirname(os.path.abspath(__file__))
-RUTA_DB = os.path.join(DIR_ACTUAL, "..", "..", "agrotech.db")
-
 # Relaciona el nombre legible de cada parcela con su ID numérico en la base de datos
-MAPA_PARCELAS = {
-    "Parcela Norte": 1,
-    "Parcela Sur": 2,
-    "Invernadero Principal": 3,
-    "Viñedo Este": 4,
-    "Huerto Central": 5
-}
 
 # Traduce el nombre técnico de la métrica al sufijo usado en sensor_id (ej. "p1_temp_amb")
 MAPA_TIPOS = {
@@ -67,125 +61,63 @@ MAPA_TIPOS = {
 # ==============================================================================
 
 class EstadoAgrotech(BaseState):
-    """
-    Gestiona el estado reactivo del panel principal:
-      - Control de sesión y rol del usuario conectado.
-      - Conexión WebSocket en segundo plano para actualizaciones en vivo.
-      - Consultas a SQLite para tarjetas, tablas y gráfica histórica.
-    """
+    _streaming_activo: bool = False
 
-    # Control interno para evitar múltiples conexiones WebSocket simultáneas
-    _id_streaming_actual: int = 0
-
-    # Listas que alimentan las tablas del catálogo y el historial reciente
     parcelas: list[list[str]] = []
-    sensores: list[list[str]] = []
+    sensores: list[list[str]] = CATALOGO_SENSORES
     lecturas: list[list[str]] = []
 
-    # Datos de sesión y selección activa en la pestaña "Lecturas en Vivo"
     rol_usuario: str = ""
     parcela_seleccionada: str = "Parcela Norte"
 
-    # Valores formateados para los indicadores circulares de microclima
     temp_amb: str = "-- ºC"
     temp_suelo: str = "-- ºC"
     lux: str = "-- Lux"
     ph: str = "-- pH"
     humedad: str = "-- %"
 
-    # Variables de estado para la pestaña "Evolución (Gráfica)"
     datos_grafica: List[Dict[str, Any]] = []
     grafica_parcela: str = "Parcela Norte"
     grafica_tipo: str = "temperaturaAmb"
     grafica_fecha_inicio: str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     grafica_fecha_fin: str = datetime.now().strftime("%Y-%m-%d")
-    valor_medio: str = "0.0"  # Se guarda como str porque ReferenceLine.y de Recharts exige str | int
-    zoom_grafica: int = 100   # Nivel de ampliación en porcentaje (100% = sin scroll horizontal)
+    valor_medio: str = "0.0"
+    zoom_grafica: int = 100
 
-    # Opciones disponibles en los desplegables de filtrado de la gráfica
-    opciones_parcelas: list[str] = [
-        "Parcela Norte",
-        "Parcela Sur",
-        "Invernadero Principal",
-        "Viñedo Este",
-        "Huerto Central"
-    ]
-    opciones_tipos: list[str] = [
-        "temperaturaAmb",
-        "humedadSuelo",
-        "luminosidad",
-        "temperaturaSuelo",
-        "ph"
-    ]
+    opciones_parcelas: list[str] = list(MAPA_PARCELAS.keys())
+    opciones_tipos: list[str] = list(MAPA_TIPOS.keys())
 
     @rx.var
     def ancho_grafica(self) -> str:
-        """Devuelve el ancho CSS de la gráfica según el nivel de zoom activo."""
         return f"{self.zoom_grafica}%"
 
     def aumentar_zoom_grafica(self):
-        """Amplía la anchura de la gráfica un 50% (hasta un máximo de 400%)."""
         if self.zoom_grafica < 400:
             self.zoom_grafica += 50
             return rx.call_script("window.dispatchEvent(new Event('resize'));")
 
     def reducir_zoom_grafica(self):
-        """
-        Reduce la anchura de la gráfica un 50% (hasta el 100% base) y reajusta
-        el desplazamiento horizontal para que nunca quede bloqueado a la derecha.
-        """
         if self.zoom_grafica > 100:
             self.zoom_grafica -= 50
-            if self.zoom_grafica <= 100:
-                return rx.call_script("""
-                    const el = document.getElementById('scroll-grafica');
-                    if (el) { el.scrollLeft = 0; }
-                    window.dispatchEvent(new Event('resize'));
-                    requestAnimationFrame(() => {
-                        const el2 = document.getElementById('scroll-grafica');
-                        if (el2) { el2.scrollLeft = 0; }
-                    });
-                """)
-            return rx.call_script("""
-                const el = document.getElementById('scroll-grafica');
-                if (el) {
-                    const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth);
-                    if (el.scrollLeft > maxScroll) { el.scrollLeft = maxScroll; }
-                }
-                window.dispatchEvent(new Event('resize'));
-            """)
+            script = JS_ZOOM_RESET if self.zoom_grafica <= 100 else JS_ZOOM_AJUSTAR
+            return rx.call_script(script)
 
     def comprobar_acceso(self):
-        """
-        Se ejecuta al cargar /panel (on_load).
-        Verifica que haya un usuario autenticado, consulta su rol en SQLite,
-        carga los datos iniciales y arranca el flujo en tiempo real.
-        """
         if self.usuario_actual == "":
             return rx.redirect("/")
-        else:
-            try:
-                with sqlite3.connect(RUTA_DB) as conexion:
-                    cursor = conexion.cursor()
-                    cursor.execute("SELECT role FROM users WHERE username = ?", (self.usuario_actual,))
-                    resultado = cursor.fetchone()
-                    if resultado:
-                        self.rol_usuario = resultado[0]
-                    else:
-                        self.rol_usuario = "usuario"
-            except sqlite3.Error:
-                self.rol_usuario = "usuario"
 
-            self.obtener_datos()
-            return EstadoAgrotech.iniciar_streaming
+        self.rol_usuario = obtener_rol_usuario(self.usuario_actual)
+        self._streaming_activo = False  # Fuerza reinicio limpio al cargar/recargar /panel
+        self.obtener_datos()
+        return EstadoAgrotech.iniciar_autorefresco
+
+    def detener_autorefresco(self):
+        self._streaming_activo = False
 
     def set_parcela_seleccionada(self, valor: str):
-        """Cambia la parcela activa, refresca sus métricas y reconecta el WebSocket."""
         self.parcela_seleccionada = valor
         self.obtener_datos()
-        return EstadoAgrotech.iniciar_streaming
 
-    # --- Setters de los filtros de la gráfica ---
     def set_grafica_parcela(self, valor: str):
         self.grafica_parcela = valor
         self.actualizar_grafica()
@@ -195,7 +127,6 @@ class EstadoAgrotech(BaseState):
         self.actualizar_grafica()
 
     def set_grafica_fecha_inicio(self, valor: str):
-        """Actualiza la fecha inicial impidiendo que sea posterior a la fecha final."""
         if valor and self.grafica_fecha_fin and valor > self.grafica_fecha_fin:
             self.grafica_fecha_inicio = self.grafica_fecha_fin
         else:
@@ -203,7 +134,6 @@ class EstadoAgrotech(BaseState):
         self.actualizar_grafica()
 
     def set_grafica_fecha_fin(self, valor: str):
-        """Actualiza la fecha final impidiendo que sea anterior a la fecha inicial."""
         if valor and self.grafica_fecha_inicio and valor < self.grafica_fecha_inicio:
             self.grafica_fecha_fin = self.grafica_fecha_inicio
         else:
@@ -211,196 +141,44 @@ class EstadoAgrotech(BaseState):
         self.actualizar_grafica()
 
     def actualizar_grafica(self):
-        """
-        Consulta en SQLite las lecturas del sensor seleccionado dentro del rango
-        de fechas elegido por el usuario, las ordena cronológicamente y calcula
-        el valor medio para la línea de referencia.
-        """
-        try:
-            with sqlite3.connect(RUTA_DB) as conexion:
-                cursor = conexion.cursor()
-
-                # Construye el identificador real del sensor (ej. "p2_humedad")
-                p_id = MAPA_PARCELAS.get(self.grafica_parcela, 1)
-                s_suffix = MAPA_TIPOS.get(self.grafica_tipo, "temp_amb")
-                target_sensor_id = f"p{p_id}_{s_suffix}"
-
-                # Construye la consulta filtrando por rango de fechas (YYYY-MM-DD)
-                condiciones = ["sensor_id = ?"]
-                parametros: list[Any] = [target_sensor_id]
-
-                if self.grafica_fecha_inicio:
-                    condiciones.append("substr(timestamp, 1, 10) >= ?")
-                    parametros.append(self.grafica_fecha_inicio)
-
-                if self.grafica_fecha_fin:
-                    condiciones.append("substr(timestamp, 1, 10) <= ?")
-                    parametros.append(self.grafica_fecha_fin)
-
-                query = f"""
-                    SELECT timestamp, value
-                    FROM sensor_data
-                    WHERE {' AND '.join(condiciones)}
-                    ORDER BY id ASC
-                """
-                cursor.execute(query, tuple(parametros))
-                datos_raw = cursor.fetchall()
-
-                grafica_formateada = []
-                suma = 0.0
-                mismo_dia = (
-                    bool(self.grafica_fecha_inicio)
-                    and self.grafica_fecha_inicio == self.grafica_fecha_fin
-                )
-
-                for fila in datos_raw:
-                    fecha_cruda_g = str(fila[0]) if fila[0] else ""
-                    if len(fecha_cruda_g) >= 19:
-                        if mismo_dia:
-                            # Si es un solo día, mostramos HH:MM:SS
-                            etiqueta_tiempo = fecha_cruda_g[11:19]
-                        else:
-                            # Si abarca varios días, mostramos DD/MM HH:MM
-                            etiqueta_tiempo = f"{fecha_cruda_g[8:10]}/{fecha_cruda_g[5:7]} {fecha_cruda_g[11:16]}"
-                    else:
-                        etiqueta_tiempo = fecha_cruda_g
-
-                    valor_g = float(fila[1]) if fila[1] is not None else 0.0
-
-                    suma += valor_g
-                    grafica_formateada.append({
-                        "hora": etiqueta_tiempo,
-                        "Valor": valor_g
-                    })
-
-                self.datos_grafica = grafica_formateada
-
-                # Calcula la media redondeada a 2 decimales y la convierte a texto
-                media_calculada = round(suma / len(datos_raw), 2) if len(datos_raw) > 0 else 0.0
-                self.valor_medio = str(media_calculada)
-
-        except sqlite3.Error as e:
-            print(f"Error al actualizar gráfica: {e}")
-            self.datos_grafica = []
-            self.valor_medio = "0.0"
+        p_id = MAPA_PARCELAS.get(self.grafica_parcela, 1)
+        s_suffix = MAPA_TIPOS.get(self.grafica_tipo, "temp_amb")
+        self.datos_grafica, self.valor_medio = obtener_datos_grafica_sensor(
+            p_id, s_suffix, self.grafica_fecha_inicio, self.grafica_fecha_fin
+        )
 
     @rx.event(background=True)
-    async def iniciar_streaming(self):
-        """
-        Tarea asíncrona en segundo plano que escucha el servidor WebSocket (puerto 8001)
-        para la parcela activa. Cada vez que llega un paquete nuevo, refresca la interfaz.
-        """
+    async def iniciar_autorefresco(self):
+        """Mantiene los datos actualizados cada 3s de forma resiliente aunque el WS caiga."""
         async with self:
-            id_parcela = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
-            if self._id_streaming_actual == id_parcela:
+            if self._streaming_activo:
                 return
-            self._id_streaming_actual = id_parcela
-
-        uri = f"ws://localhost:8001/ws/parcels/{id_parcela}"
+            self._streaming_activo = True
 
         try:
-            async with websockets.connect(uri) as websocket:
-                while True:
-                    async with self:
-                        if self._id_streaming_actual != id_parcela:
-                            break
-
-                    mensaje = await websocket.recv()
-
-                    async with self:
-                        self.obtener_datos()
-
-        except Exception as e:
-            print(f"Streaming desconectado de parcela {id_parcela}: {e}")
+            while True:
+                async with self:
+                    if not self._streaming_activo:
+                        break
+                    self.obtener_datos()
+                await asyncio.sleep(3)
+        finally:
             async with self:
-                self._id_streaming_actual = 0
+                self._streaming_activo = False
 
     def obtener_datos(self):
-        """
-        Sincroniza el estado con la base de datos:
-          1. Carga el listado de parcelas registradas.
-          2. Define el catálogo de tipos de sensores.
-          3. Obtiene las últimas 15 lecturas globales con código de color térmico.
-          4. Carga la última lectura de cada sensor de la parcela seleccionada.
-          5. Refresca también los datos de la gráfica.
-        """
-        try:
-            with sqlite3.connect(RUTA_DB) as conexion:
-                cursor = conexion.cursor()
+        self.parcelas = obtener_parcelas_tabla()
+        self.lecturas = obtener_ultimas_lecturas_tabla(limit=15)
 
-                # 1. Listado de parcelas (con respaldo estático si la tabla está vacía)
-                cursor.execute("SELECT id, name, location FROM parcels ORDER BY id ASC")
-                filas_parcelas = cursor.fetchall()
-                if filas_parcelas:
-                    self.parcelas = [[str(col) if col is not None else "" for col in row] for row in filas_parcelas]
-                else:
-                    self.parcelas = [
-                        ["1", "Parcela Norte", "Sector A"],
-                        ["2", "Parcela Sur", "Sector B"],
-                        ["3", "Invernadero Principal", "Sector C"],
-                        ["4", "Viñedo Este", "Sector D"],
-                        ["5", "Huerto Central", "Sector E"]
-                    ]
+        p_id = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
+        metricas = obtener_metricas_actuales_parcela(p_id)
+        self.temp_amb = metricas["temp_amb"]
+        self.temp_suelo = metricas["temp_suelo"]
+        self.humedad = metricas["humedad"]
+        self.lux = metricas["lux"]
+        self.ph = metricas["ph"]
 
-                # 2. Catálogo descriptivo de sensores por parcela
-                self.sensores = [
-                    ["p#_humedad", "humedadSuelo", "%", "Sensor Humedad Suelo"],
-                    ["p#_lux", "luminosidad", "lux", "Sensor Luz Solar"],
-                    ["p#_ph", "ph", "pH", "Sensor pH Suelo"],
-                    ["p#_temp_amb", "temperaturaAmb", "ºC", "Sensor Temp. Ambiente"],
-                    ["p#_temp_suelo", "temperaturaSuelo", "ºC", "Sensor Temp. Suelo"]
-                ]
-
-                # 3. Últimas 15 lecturas recibidas para la tabla inferior
-                cursor.execute("""
-                    SELECT sensor_id, timestamp, value
-                    FROM sensor_data
-                    ORDER BY id DESC LIMIT 15
-                """)
-                datos_brutos = cursor.fetchall()
-                datos_formateados = []
-
-                for fila in datos_brutos:
-                    sensor = str(fila[0]) if fila[0] else "Desconocido"
-                    fecha_cruda = str(fila[1]) if fila[1] else ""
-                    fecha_limpia = fecha_cruda[:19].replace('T', ' ') if len(fecha_cruda) >= 19 else fecha_cruda
-                    valor_real = float(fila[2]) if fila[2] is not None else 0.0
-
-                    # Código de color para alertas visuales de temperatura (>30ºC cálido, <20ºC frío)
-                    color_texto = "var(--gray-12)"
-                    if "temp" in sensor:
-                        if valor_real > 30:
-                            color_texto = "#ff8da1"
-                        elif valor_real < 20:
-                            color_texto = "#82b1ff"
-                        else:
-                            color_texto = "#66cdaa"
-
-                    datos_formateados.append([sensor, fecha_limpia, str(valor_real), color_texto])
-
-                self.lecturas = datos_formateados
-
-                # 4. Último valor registrado por cada sensor de la parcela seleccionada
-                p_id = MAPA_PARCELAS.get(self.parcela_seleccionada, 1)
-                cursor.execute("""
-                    SELECT sensor_id, value FROM sensor_data
-                    WHERE sensor_id LIKE ? AND id IN (
-                        SELECT MAX(id) FROM sensor_data GROUP BY sensor_id
-                    )
-                """, (f"p{p_id}_%",))
-                ultimos_datos = dict(cursor.fetchall())
-
-                self.temp_amb = f"{ultimos_datos.get(f'p{p_id}_temp_amb', '--')} ºC"
-                self.temp_suelo = f"{ultimos_datos.get(f'p{p_id}_temp_suelo', '--')} ºC"
-                self.humedad = f"{ultimos_datos.get(f'p{p_id}_humedad', '--')} %"
-                self.lux = f"{ultimos_datos.get(f'p{p_id}_lux', '--')} Lux"
-                self.ph = f"{ultimos_datos.get(f'p{p_id}_ph', '--')} pH"
-
-                # 5. Actualización sincronizada de la gráfica
-                self.actualizar_grafica()
-
-        except sqlite3.Error as e:
-            print(f"Error en la base de datos: {e}")
+        self.actualizar_grafica()
 
 
 # ==============================================================================
@@ -767,32 +545,9 @@ def fila_lectura(fila: list[str]) -> rx.Component:
 def index() -> rx.Component:
     """Construye la página principal completa: estilos, navbar, cabecera y pestañas."""
     return rx.box(
-        # Sobrescritura de tokens de color de Radix UI para paleta personalizada en modo claro y oscuro
-        rx.html("""
-            <style>
-                :root, .light, .light-theme {
-                    color-scheme: light;
-                    --gray-1: #F4F7F8 !important;
-                    --gray-2: #EBF0F2 !important;
-                    --gray-3: #E1E8EC !important;
-                    --gray-4: #D3DEE3 !important;
-                    --gray-5: #C5D4DC !important;
-                    --gray-11: #4A636E !important;
-                    --gray-12: #1A2E35 !important;
-                }
-                .dark, .dark-theme, [data-theme="dark"] {
-                    color-scheme: dark;
-                    --gray-1: #0D2F3A !important;
-                    --gray-2: #09242E !important;
-                    --gray-3: #123C4A !important;
-                    --gray-4: #174859 !important;
-                    --gray-5: #1D566B !important;
-                    --gray-6: #2A718B !important;
-                    --gray-11: #B8D4DF !important;
-                    --gray-12: #F0F8FA !important;
-                }
-            </style>
-        """),
+        ESTILOS_TEMA,
+
+        # --- BARRA DE NAVEGACIÓN SUPERIOR (NAVBAR) ---
 
         # --- BARRA DE NAVEGACIÓN SUPERIOR (NAVBAR) ---
         rx.hstack(
@@ -971,6 +726,7 @@ def index() -> rx.Component:
         min_height="100vh",
         overflow_x="clip",
         background_color="var(--gray-1)",
+        on_unmount=EstadoAgrotech.detener_autorefresco,
     )
 
 
